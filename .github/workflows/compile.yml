@@ -28,16 +28,16 @@ jobs:
 
     - name: Compile Sketch
       run: |
-        # Replace 'esp.txt' with the actual name of your .ino file if you rename it
-        # Compiles specifically for the ESP32 Dev Module
-        arduino-cli compile --fqbn esp32:esp32:esp32 esp.txt --output-dir ./build
+        # Creates a matching folder directory so the Arduino CLI can parse the sketch successfully
+        mkdir -p main
+        cp main.ino main/main.ino
+        arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build
 
     - name: Commit and Push Compiled Binary
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        mkdir -p main
-        cp build/esp.txt.bin firmware.bin
+        cp build/main.bin firmware.bin
         git add firmware.bin
         git commit -m "Automated firmware compilation" || exit 0
         git push
