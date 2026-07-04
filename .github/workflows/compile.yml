@@ -3,7 +3,7 @@ name: Compile ESP32 Firmware
 on:
   push:
     branches:
-      - main  # Triggers compilation every time you push changes to the main branch
+      - main  # Triggers the compilation every time you push to the main branch
 
 jobs:
   build:
@@ -26,19 +26,19 @@ jobs:
         arduino-cli lib install "Adafruit GFX Library"
         arduino-cli lib install "Adafruit SH110X"
 
-    - name: Compile and Generate Firmware
+    - name: Compile Sketch
       run: |
-        # Automatically creates the sketch folder required by Arduino
+        # Creates a matching folder directory so the Arduino CLI can parse the sketch successfully
         mkdir -p main
         cp main.ino main/main.ino
-        
-        # Directly tells the compiler to output a single file named 'firmware.bin'
-        arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dest ./firmware.bin
+        arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build
 
-    - name: Commit and Push to Repository
+    - name: Commit and Push Compiled Binary
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
+        # Explicitly copies the exact application binary file using the known output naming convention
+        cp build/main.ino.bin firmware.bin
         git add firmware.bin
         git commit -m "Automated firmware compilation" || exit 0
         git push
