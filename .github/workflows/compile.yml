@@ -37,7 +37,8 @@ jobs:
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        cp build/main.bin firmware.bin
+        # Uses a wildcard (*) to grab the compiled binary file regardless of the board's internal name
+        cp build/*.bin firmware.bin
         git add firmware.bin
         git commit -m "Automated firmware compilation" || exit 0
         git push
