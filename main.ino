@@ -6,7 +6,7 @@
  *********************************************************************/
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>  // Switched library header to SH110X
+#include <Adafruit_SH110X.h>
 #include <WiFi.h>
 #include <Preferences.h>
 #include <time.h>
@@ -23,7 +23,7 @@ const char* WIFI_SSID      = "Afia Mahir";
 const char* WIFI_PASS      = "afiamahir2026";
 const long  GMT_OFFSET_SEC = 21600; // Bangladesh GMT+6
 const int   DST_OFFSET_SEC = 0;
-const char* NTP_SERVER     = "asia.pool.ntp.org"; // Optimization: Regional Asian pool
+const char* NTP_SERVER     = "asia.pool.ntp.org";
 
 // OTA Update Configuration
 const int   CURRENT_VERSION = 1;
@@ -33,21 +33,21 @@ const char* BIN_URL         = "https://raw.githubusercontent.com/itsfortestlol-s
 /* ------------------------------ Pins ------------------------------- */
 #define PIN_OLED_SDA   21
 #define PIN_OLED_SCL   22
-#define PIN_TOUCH      4      // TTP223 SIG, active HIGH
-#define PIN_VBAT       34     // ADC1_CH6, via 100k/100k divider
+#define PIN_TOUCH      4
+#define PIN_VBAT       34
 
 /* ------------------------- Battery calibration --------------------- */
-const float VBAT_DIVIDER   = 2.0f; // 100k/100k halves the voltage
-const float VBAT_CAL       = 1.00f; // fine-tune vs multimeter reading
-const float VBAT_FULL      = 4.20f; // = 100 %
-const float VBAT_EMPTY     = 3.30f; // = 0 %
+const float VBAT_DIVIDER   = 2.0f;
+const float VBAT_CAL       = 1.00f;
+const float VBAT_FULL      = 4.20f;
+const float VBAT_EMPTY     = 3.30f;
 
 /* --------------------------- Touch timing -------------------------- */
-const unsigned long TOUCH_DEBOUNCE_MS    = 30; // TTP223 is clean; 30ms is plenty
-const unsigned long DOUBLE_TAP_WINDOW_MS = 300; // max gap between two taps
+const unsigned long TOUCH_DEBOUNCE_MS    = 30;
+const unsigned long DOUBLE_TAP_WINDOW_MS = 300;
 
 /* ------------------------------ Idle ------------------------------- */
-const unsigned long IDLE_TIMEOUT = 20000; // 20 s -> back to Mochi
+const unsigned long IDLE_TIMEOUT = 20000;
 
 /* =========================== App Modes ============================= */
 enum AppMode { MODE_MOCHI, MODE_WATCH, MODE_FLAPPY, MODE_UPDATE };
@@ -56,19 +56,19 @@ enum TapEvent { TAP_NONE, TAP_SINGLE, TAP_DOUBLE };
 /* ======================== DisplayManager =========================== */
 class DisplayManager {
 public:
-  Adafruit_SH1106G oled; // Switched hardware instance class to SH1106G
+  Adafruit_SH1106G oled;
   DisplayManager() : oled(128, 64, &Wire, -1) {}
 
   bool begin() {
     Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
-    Wire.setClock(400000);                     // fast I2C = smoother frames
-    if (!oled.begin(0x3C, true)) return false; // Initialized using SH1106 constraints
+    Wire.setClock(400000);
+    if (!oled.begin(0x3C, true)) return false;
     oled.clearDisplay();
     oled.setTextColor(SH110X_WHITE);
     oled.display();
     return true;
   }
-  /* Helper: centered text at a given text size */
+
   void centerText(const char* s, int16_t y, uint8_t size) {
     oled.setTextSize(size);
     int16_t w = strlen(s) * 6 * size;
@@ -77,11 +77,7 @@ public:
   }
 };
 
-/* ========================= TouchManager ============================
- * Debounced edge detection + single/double tap discrimination.
- * A single tap is reported only after DOUBLE_TAP_WINDOW_MS passes
- * without a second tap.
- */
+/* ========================= TouchManager ============================ */
 class TouchManager {
   bool stableState = false, lastRead = false;
   unsigned long lastChangeMs = 0, firstTapMs = 0;
@@ -97,7 +93,7 @@ public:
 
     if ((now - lastChangeMs) >= TOUCH_DEBOUNCE_MS && raw != stableState) {
       stableState = raw;
-      if (stableState) {                      // debounced press (rising edge)
+      if (stableState) {
         if (waitingSecondTap && (now - firstTapMs) <= DOUBLE_TAP_WINDOW_MS) {
           waitingSecondTap = false;
           ev = TAP_DOUBLE;
@@ -107,7 +103,6 @@ public:
         }
       }
     }
-    /* First tap "expires" -> it was a single tap */
     if (waitingSecondTap && (now - firstTapMs) > DOUBLE_TAP_WINDOW_MS) {
       waitingSecondTap = false;
       ev = TAP_SINGLE;
@@ -123,11 +118,11 @@ class BatteryManager {
   int percent = 50;
 public:
   void begin() {
-    analogSetPinAttenuation(PIN_VBAT, ADC_11db); // full 0-3.3V range
-    sample();                                     // initial reading
+    analogSetPinAttenuation(PIN_VBAT, ADC_11db);
+    sample();
   }
   void update() {
-    if (millis() - lastReadMs >= 5000) sample(); // every 5 s
+    if (millis() - lastReadMs >= 5000) sample();
   }
   void sample() {
     lastReadMs = millis();
@@ -141,10 +136,7 @@ public:
   float getVoltage() const { return voltage; }
 };
 
-/* ========================== TimeManager ============================
- * Non-blocking background sync loop. If connection fails, drops 
- * out cleanly and initiates background re-try passes every 60s.
- */
+/* ========================== TimeManager ============================ */
 class TimeManager {
   enum St { CONNECTING, SYNCING, DONE };
   St state = CONNECTING;
@@ -167,20 +159,19 @@ public:
       if (WiFi.status() == WL_CONNECTED) {
         configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
         state = SYNCING; startMs = now;
-      } else if (now - startMs > 30000) {   // Extended from 15s to 30s
+      } else if (now - startMs > 30000) {
         shutdownWifi();
         lastRetryMs = now;
       }
     } else if (state == SYNCING) {
-      if (time(nullptr) > 1700000000) {          // Sane epoch verified => synced
+      if (time(nullptr) > 1700000000) {
         synced = true;
-        shutdownWifi();                          // save battery
-      } else if (now - startMs > 15000) {   // Extended from 10s to 15s
+        shutdownWifi();
+      } else if (now - startMs > 15000) {
         shutdownWifi();
         lastRetryMs = now;
       }
     } else if (state == DONE && !synced) {
-      /* If sync dropped or failed, trigger a background evaluation sequence every 60 seconds */
       if (now - lastRetryMs > 60000) {
         startSync();
       }
@@ -198,10 +189,7 @@ public:
   }
 };
 
-/* ============================ MochiApp ==============================
- * Dasai-Mochi-style face: two rounded-rect eyes + small mouth, drawn
- * procedurally (crisp 1-bit pixel look).
- * Blinks, bounces, looks around, random expressions, and a tap reaction. */
+/* ============================ MochiApp ============================== */
 class MochiApp {
   DisplayManager* dm;
   enum Expr { EX_NORMAL, EX_LOOK_L, EX_LOOK_R, EX_HAPPY, EX_SURPRISED };
@@ -217,22 +205,20 @@ public:
   }
   void onEnter() { expr = EX_NORMAL; reactionEndMs = 0; }
 
-  void onSingleTap() {                         // reaction animation
-    reactionHappy = random(0, 2);              // happy or surprised
+  void onSingleTap() {
+    reactionHappy = random(0, 2);
     reactionEndMs = millis() + 1500;
   }
 
   void update() {
     unsigned long now = millis();
-    if (now - lastFrameMs < 33) return;        // ~30 fps cap
+    if (now - lastFrameMs < 33) return;
     lastFrameMs = now;
-    /* Random expression scheduler (skipped during reaction) */
     if (now >= nextExprMs && now >= reactionEndMs) {
       Expr pool[] = { EX_NORMAL, EX_NORMAL, EX_LOOK_L, EX_LOOK_R, EX_HAPPY };
       expr = pool[random(0, 5)];
       nextExprMs = now + random(3000, 6000);
     }
-    /* Blink scheduler */
     if (!blinking && now >= nextBlinkMs) { blinking = true; blinkStartMs = now; }
     if (blinking && now - blinkStartMs > 180) {
       blinking = false;
@@ -242,9 +228,8 @@ public:
   }
 
   void draw(unsigned long now) {
-    Adafruit_SH1106G& o = dm->oled; // Internal display reference cast to SH1106G
+    Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
-    /* Gentle bounce: whole face floats up/down */
     int bounce = (int)(2.0f * sinf(now / 400.0f));
     int lookX  = 0;
     Expr e = expr;
@@ -252,37 +237,31 @@ public:
     if (e == EX_LOOK_L) lookX = -8;
     if (e == EX_LOOK_R) lookX =  8;
     int eyeY = 18 + bounce;
-    int lx = 34 + lookX, rx = 74 + lookX; // eye left edges
+    int lx = 34 + lookX, rx = 74 + lookX;
     int eyeW = 20, eyeH = 26;
-    /* Blink squeezes eye height toward a thin line */
     if (blinking) {
-      float ph = (now - blinkStartMs) / 180.0f; // 0..1
-      float k  = 1.0f - sinf(ph * PI);          // 1->0->1
+      float ph = (now - blinkStartMs) / 180.0f;
+      float k  = 1.0f - sinf(ph * PI);
       eyeH = max(3, (int)(26 * k));
       eyeY = 18 + bounce + (26 - eyeH) / 2;
     }
 
     if (e == EX_HAPPY) {
-      /* "^ ^" happy eyes: thick upward arcs */
       for (int t = 0; t < 3; t++) {
         o.drawLine(lx, eyeY + 16, lx + 10, eyeY + 6 + t, SSD1306_WHITE);
         o.drawLine(lx + 10, eyeY + 6 + t, lx + 20, eyeY + 16, SSD1306_WHITE);
         o.drawLine(rx, eyeY + 16, rx + 10, eyeY + 6 + t, SSD1306_WHITE);
         o.drawLine(rx + 10, eyeY + 6 + t, rx + 20, eyeY + 16, SSD1306_WHITE);
       }
-      /* Small open smile */
       o.fillCircle(64 + lookX, 50 + bounce, 4, SSD1306_WHITE);
       o.fillRect(58 + lookX, 44 + bounce, 13, 6, SSD1306_BLACK);
     } else if (e == EX_SURPRISED) {
-      /* Round wide eyes + "o" mouth */
       o.fillCircle(lx + 10, eyeY + 13, 11, SSD1306_WHITE);
       o.fillCircle(rx + 10, eyeY + 13, 11, SSD1306_WHITE);
       o.drawCircle(64 + lookX, 52 + bounce, 4, SSD1306_WHITE);
     } else {
-      /* Classic rounded-rect mochi eyes */
       o.fillRoundRect(lx, eyeY, eyeW, eyeH, 8, SSD1306_WHITE);
       o.fillRoundRect(rx, eyeY, eyeW, eyeH, 8, SSD1306_WHITE);
-      /* Tiny flat mouth */
       o.fillRoundRect(60 + lookX, 52 + bounce, 8, 2, 1, SSD1306_WHITE);
     }
     o.display();
@@ -293,44 +272,29 @@ public:
 class WatchApp {
   DisplayManager* dm;
   TimeManager* tm;
-  BatteryManager* bm;
   int lastSecond = -1;
 public:
-  void begin(DisplayManager* d, TimeManager* t, BatteryManager* b) {
-    dm = d; tm = t; bm = b;
+  void begin(DisplayManager* d, TimeManager* t) {
+    dm = d; tm = t;
   }
-  void onEnter() { lastSecond = -1; }          // force immediate redraw
+  void onEnter() { lastSecond = -1; }
 
   void update() {
     struct tm t;
     tm->getLocal(t);
-    if (t.tm_sec == lastSecond) return;        // redraw only once per second
+    if (t.tm_sec == lastSecond) return;
     lastSecond = t.tm_sec;
     draw(t);
   }
 
   void draw(struct tm& t) {
-    Adafruit_SH1106G& o = dm->oled; // Internal display reference cast to SH1106G
+    Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
     char buf[24];
 
-    /* --- Battery icon + %, top-right --- */
-    int pct = bm->getPercent();
-    int bx = 106, by = 2;                      // icon 18x8 + nub
-    o.drawRect(bx, by, 18, 8, SSD1306_WHITE);
-    o.fillRect(bx + 18, by + 2, 2, 4, SSD1306_WHITE);
-    int fillW = map(pct, 0, 100, 0, 14);
-    if (fillW > 0) o.fillRect(bx + 2, by + 2, fillW, 4, SSD1306_WHITE);
-    snprintf(buf, sizeof(buf), "%d%%", pct);
-    o.setTextSize(1);
-    o.setCursor(bx - 6 * strlen(buf) - 3, by + 1);
-    o.print(buf);
-
-    /* NOTE: The NTP status hint text (NTP/--) has been removed from here */
-
     /* --- Big HH:MM, centered --- */
     snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-    dm->centerText(buf, 20, 3); // size 3 = 90px wide
+    dm->centerText(buf, 20, 3);
 
     /* --- Seconds, small, under the time --- */
     snprintf(buf, sizeof(buf), ":%02d", t.tm_sec);
@@ -354,18 +318,15 @@ public:
   enum GState { G_START, G_PLAYING, G_OVER };
   GState gstate = G_START;
 private:
-  /* Bird */
   float birdY = 32, birdV = 0;
   static constexpr int BIRD_X = 24, BIRD_R = 3;
-  /* Physics (per 33 ms frame) */
   static constexpr float GRAVITY = 0.28f, FLAP_V = -2.9f;
-  /* Pipes */
   static constexpr int NPIPES = 3, PIPE_W = 12, GAP_H = 26, PIPE_SPACING = 52;
   int pipeX[NPIPES], gapY[NPIPES];
   bool passed[NPIPES];
   int score = 0, best = 0;
   unsigned long lastFrameMs = 0;
-  bool dirty = true;                           // static screens draw once
+  bool dirty = true;
 public:
   void begin(DisplayManager* d) {
     dm = d;
@@ -378,7 +339,7 @@ public:
   void onSingleTap() {
     if (gstate == G_START)        startGame();
     else if (gstate == G_PLAYING) birdV = FLAP_V;
-    else                          startGame(); // Game Over -> restart
+    else                          startGame();
   }
 
   void startGame() {
@@ -393,20 +354,18 @@ public:
 
   void update() {
     unsigned long now = millis();
-    if (now - lastFrameMs < 33) return;        // ~30 fps
+    if (now - lastFrameMs < 33) return;
     lastFrameMs = now;
 
     if (gstate == G_START)   { if (dirty) { drawStart(); dirty = false; } return; }
     if (gstate == G_OVER)    { if (dirty) { drawGameOver(); dirty = false; } return; }
 
-    /* ---- Physics ---- */
     birdV += GRAVITY;
     birdY += birdV;
 
-    /* ---- Pipes ---- */
     for (int i = 0; i < NPIPES; i++) {
       pipeX[i] -= 2;
-      if (pipeX[i] + PIPE_W < 0) {             // recycle off-screen pipe
+      if (pipeX[i] + PIPE_W < 0) {
         pipeX[i] = pipeX[(i + NPIPES - 1) % NPIPES] + PIPE_SPACING;
         gapY[i]  = random(10, 64 - 10 - GAP_H);
         passed[i] = false;
@@ -417,7 +376,6 @@ public:
       }
     }
 
-    /* ---- Collisions ---- */
     bool dead = (birdY - BIRD_R <= 0) || (birdY + BIRD_R >= 63);
     for (int i = 0; i < NPIPES && !dead; i++) {
       bool inX = (BIRD_X + BIRD_R > pipeX[i]) && (BIRD_X - BIRD_R < pipeX[i] + PIPE_W);
@@ -433,7 +391,7 @@ public:
   }
 
   void drawStart() {
-    Adafruit_SH1106G& o = dm->oled; // Internal display reference cast to SH1106G
+    Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
     dm->centerText("FLAPPY BIRD", 10, 1);
     o.drawRoundRect(34, 28, 60, 16, 4, SSD1306_WHITE);
@@ -443,23 +401,23 @@ public:
   }
 
   void drawGame() {
-    Adafruit_SH1106G& o = dm->oled; // Internal display reference cast to SH1106G
+    Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
-    for (int i = 0; i < NPIPES; i++) {         // pipes
+    for (int i = 0; i < NPIPES; i++) {
       o.fillRect(pipeX[i], 0, PIPE_W, gapY[i], SSD1306_WHITE);
       o.fillRect(pipeX[i], gapY[i] + GAP_H, PIPE_W, 64 - gapY[i] - GAP_H, SSD1306_WHITE);
     }
-    o.drawFastHLine(0, 63, 128, SSD1306_WHITE); // ground
-    o.fillCircle(BIRD_X, (int)birdY, BIRD_R, SSD1306_WHITE); // bird
-    o.drawPixel(BIRD_X + 2, (int)birdY - 1, SSD1306_BLACK); // eye
-    char buf[8];                                            // score
+    o.drawFastHLine(0, 63, 128, SSD1306_WHITE);
+    o.fillCircle(BIRD_X, (int)birdY, BIRD_R, SSD1306_WHITE);
+    o.drawPixel(BIRD_X + 2, (int)birdY - 1, SSD1306_BLACK);
+    char buf[8];
     snprintf(buf, sizeof(buf), "%d", score);
     dm->centerText(buf, 0, 1);
     o.display();
   }
 
   void drawGameOver() {
-    Adafruit_SH1106G& o = dm->oled; // Internal display reference cast to SH1106G
+    Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
     dm->centerText("GAME OVER", 8, 1);
     char buf[20];
@@ -587,14 +545,14 @@ private:
           WiFiClient* stream = http.getStreamPtr();
           size_t written = 0;
           uint8_t buff[256];
-          
+
           while (http.connected() && written < contentLength) {
             size_t size = stream->available();
             if (size) {
               int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
               Update.write(buff, c);
               written += c;
-              
+
               o.clearDisplay();
               dm->centerText("FLASHING UPDATE", 5, 1);
               int progressWidth = map(written, 0, contentLength, 0, 100);
@@ -658,10 +616,10 @@ void setup() {
   }
   touchMgr.begin();
   batteryMgr.begin();
-  timeMgr.begin(); // non-blocking WiFi/NTP
+  timeMgr.begin();
 
   mochiApp.begin(&displayMgr);
-  watchApp.begin(&displayMgr, &timeMgr, &batteryMgr);
+  watchApp.begin(&displayMgr, &timeMgr);
   flappyApp.begin(&displayMgr);
   updateApp.begin(&displayMgr);
 
@@ -672,40 +630,35 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  /* Background services */
   timeMgr.update();
   batteryMgr.update();
 
-  /* Touch events */
   TapEvent ev = touchMgr.update();
   if (ev != TAP_NONE) lastInteractionMs = now;
   if (ev == TAP_DOUBLE) {
-    /* Circular: Mochi -> Watch -> Flappy -> Update -> Mochi */
     enterMode(mode == MODE_MOCHI  ? MODE_WATCH :
               mode == MODE_WATCH  ? MODE_FLAPPY :
               mode == MODE_FLAPPY ? MODE_UPDATE : MODE_MOCHI);
   } else if (ev == TAP_SINGLE) {
     switch (mode) {
       case MODE_MOCHI:  mochiApp.onSingleTap(); break;
-      case MODE_WATCH:  /* no single-tap action */ break;
+      case MODE_WATCH:  break;
       case MODE_FLAPPY: flappyApp.onSingleTap(); break;
-      case MODE_UPDATE: /* No action */ break;
+      case MODE_UPDATE: break;
     }
   }
 
-  /* Idle timeout: Watch & Flappy (not while game is running) */
   if (mode == MODE_FLAPPY && flappyApp.isPlaying()) {
-    lastInteractionMs = now; // pause idle timer in-game
+    lastInteractionMs = now;
   }
   if (mode == MODE_UPDATE) {
-    lastInteractionMs = now; // Don't time out while updating
+    lastInteractionMs = now;
   }
   if (mode != MODE_MOCHI && (now - lastInteractionMs) >= IDLE_TIMEOUT) {
     lastInteractionMs = now;
     enterMode(MODE_MOCHI);
   }
 
-  /* Run active mode */
   switch (mode) {
     case MODE_MOCHI:  mochiApp.update();  break;
     case MODE_WATCH:  watchApp.update();  break;
