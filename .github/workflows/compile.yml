@@ -37,8 +37,8 @@ jobs:
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        # Uses a wildcard (*) to grab the compiled binary file regardless of the board's internal name
-        cp build/*.bin firmware.bin
+        # Finds the main app binary while explicitly skipping bootloader and partitions files
+        cp $(find build -type f -name "*.bin" ! -name "*partitions*" ! -name "*bootloader*") firmware.bin
         git add firmware.bin
         git commit -m "Automated firmware compilation" || exit 0
         git push
