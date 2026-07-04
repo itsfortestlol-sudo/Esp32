@@ -28,23 +28,33 @@ const int   CURRENT_VERSION = 1;
 const char* VERSION_URL     = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/main.ino";
 const char* BIN_URL         = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/firmware.bin";
 
+/* ------------------------------ Pins ------------------------------- */
 #define PIN_OLED_SDA   21
 #define PIN_OLED_SCL   22
 #define PIN_TOUCH      4
 #define PIN_VBAT       34
 
-const float VBAT_DIVIDER   = 2.0f;
-const float VBAT_CAL       = 1.00f;
-const float VBAT_FULL      = 4.20f;
-const float VBAT_EMPTY     = 3.30f;
+/* ------------------------- Battery calibration --------------------- */
+const float VBAT_DIVIDER = 2.0f;
+const float VBAT_CAL     = 1.00f;
+const float VBAT_FULL    = 4.20f;
+const float VBAT_EMPTY   = 3.30f;
 
+/* --------------------------- Touch timing -------------------------- */
 const unsigned long TOUCH_DEBOUNCE_MS    = 30;
 const unsigned long DOUBLE_TAP_WINDOW_MS = 300;
-const unsigned long IDLE_TIMEOUT = 20000;
 
-// Mochi idle neglect timeout (10 minutes)
-const unsigned long NEGLECT_TIMEOUT = 600000UL;
+/* ------------------------------ Idle ------------------------------- */
+const unsigned long IDLE_TIMEOUT     = 20000;
+const unsigned long NEGLECT_TIMEOUT  = 600000UL; // 10 minutes
 
+/* ======================= Global Shared State ======================= */
+// Cross-app communication flags
+bool g_newHighScore      = false;  // Set by FlappyApp, read+cleared by MochiApp
+int  g_happiness         = 75;     // 0-100, global Mochi mood
+int  g_currentHour       = 12;     // Updated by TimeManager each loop
+
+/* =========================== App Modes ============================= */
 enum AppMode { MODE_MOCHI, MODE_WATCH, MODE_FLAPPY, MODE_UPDATE };
 enum TapEvent { TAP_NONE, TAP_SINGLE, TAP_DOUBLE };
 
@@ -140,35 +150,53 @@ class TimeManager {
   bool synced = false;
 public:
   void begin() { startSync(); }
+
   void startSync() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     state = CONNECTING;
     startMs = millis();
   }
+
   void update() {
     unsigned long now = millis();
     if (state == CONNECTING) {
       if (WiFi.status() == WL_CONNECTED) {
         configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
-        state = SYNCING; startMs = now;
+        state = SYNCING;
+        startMs = now;
       } else if (now - startMs > 30000) {
-        shutdownWifi(); lastRetryMs = now;
+        shutdownWifi();
+        lastRetryMs = now;
       }
     } else if (state == SYNCING) {
       if (time(nullptr) > 1700000000) {
-        synced = true; shutdownWifi();
+        synced = true;
+        shutdownWifi();
       } else if (now - startMs > 15000) {
-        shutdownWifi(); lastRetryMs = now;
+        shutdownWifi();
+        lastRetryMs = now;
       }
     } else if (state == DONE && !synced) {
       if (now - lastRetryMs > 60000) startSync();
     }
+
+    // Update global hour every cycle
+    if (synced) {
+      struct tm t;
+      getLocal(t);
+      g_currentHour = t.tm_hour;
+    }
   }
+
   void shutdownWifi() {
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF); state = DONE;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    state = DONE;
   }
+
   bool isSynced() const { return synced; }
+
   void getLocal(struct tm& t) {
     time_t current = time(nullptr);
     localtime_r(&current, &t);
@@ -179,98 +207,114 @@ public:
 class MochiApp {
   DisplayManager* dm;
 
-  // All possible autonomous activities + emotional states
   enum Activity {
-    ACT_IDLE,           // normal resting
-    ACT_WATCHING_PHONE, // looking at phone
-    ACT_DRINKING_COFFEE,// drinking coffee
-    ACT_EATING,         // eating something
-    ACT_YAWNING,        // yawning
-    ACT_ROLLING_EYES,   // rolling eyes 🙄
-    ACT_WHISTLING,      // whistling 😗
-    ACT_POUTY,          // pouty face 😒
-    ACT_BLANK_STARE,    // blank stare 😑
-    ACT_BIG_GRIN,       // big grin 😁
-    ACT_THINKING,       // thinking with hand on chin
-    ACT_STRETCHING,     // stretching arms
-    ACT_DANCING,        // little bounce dance
-    ACT_WINKING,        // wink
-    // Neglect states (triggered after long no-interaction)
-    ACT_SAD,            // sad face
-    ACT_CRYING,         // crying
-    ACT_SLEEPING,       // sleeping zzz
-    ACT_LONELY,         // lonely stare
-    // Touch reaction states
-    ACT_TOUCHED_HAPPY,  // feels good from touch
-    ACT_TOUCHED_BLUSH,  // blushing
-    ACT_TOUCHED_GIGGLE, // giggling
+    // Normal activities
+    ACT_IDLE,
+    ACT_WATCHING_PHONE,
+    ACT_DRINKING_COFFEE,
+    ACT_EATING,
+    ACT_YAWNING,
+    ACT_ROLLING_EYES,
+    ACT_WHISTLING,
+    ACT_POUTY,
+    ACT_BLANK_STARE,
+    ACT_BIG_GRIN,
+    ACT_THINKING,
+    ACT_STRETCHING,
+    ACT_DANCING,
+    ACT_WINKING,
+    // Neglect / sad states
+    ACT_SAD,
+    ACT_CRYING,
+    ACT_SLEEPING,
+    ACT_LONELY,
+    // Touch reactions
+    ACT_TOUCHED_HAPPY,
+    ACT_TOUCHED_BLUSH,
+    ACT_TOUCHED_GIGGLE,
+    // Special states
+    ACT_CELEBRATING,   // triggered by new Flappy high score
+    ACT_NIGHT_GROGGY,  // tapped during night sleep
   };
 
-  Activity currentActivity = ACT_IDLE;
-  Activity nextActivity = ACT_IDLE;
-  unsigned long activityStartMs = 0;
-  unsigned long activityDurationMs = 3000;
-  unsigned long nextActivityMs = 0;
-  unsigned long lastFrameMs = 0;
-  unsigned long lastInteractionMs = 0;
-  unsigned long lastTouchMs = 0;
+  Activity currentActivity   = ACT_IDLE;
+  unsigned long activityStartMs  = 0;
+  unsigned long nextActivityMs   = 0;
+  unsigned long lastFrameMs      = 0;
+  unsigned long lastTouchMs      = 0;
 
-  bool blinking = false;
-  unsigned long nextBlinkMs = 0;
+  bool blinking          = false;
+  unsigned long nextBlinkMs  = 0;
   unsigned long blinkStartMs = 0;
 
-  bool neglected = false;
-  bool touchReaction = false;
+  bool neglected         = false;
+  bool touchReaction     = false;
   unsigned long touchReactionEndMs = 0;
 
-  // Animation sub-frame counters
-  int animFrame = 0;
+  // Sub-animation state
+  int  animFrame         = 0;
   unsigned long lastAnimFrameMs = 0;
+  int  zCount            = 0;
+  unsigned long lastZMs  = 0;
+  float dancePhase       = 0.0f;
+  int   tearY1           = 20;
+  int   tearY2           = 20;
 
-  // For sleeping animation
-  int zCount = 0;
-  unsigned long lastZMs = 0;
+  // Night-groggy one-shot flag
+  bool groggySent        = false;
 
-  // For eating animation
-  int eatFrame = 0;
-
-  // For dancing
-  float dancePhase = 0;
-
-  // For crying
-  int tearY1 = 20, tearY2 = 20;
+  // Happiness decay timer
+  unsigned long lastHappyDecayMs = 0;
 
 public:
   void begin(DisplayManager* d) {
     dm = d;
-    lastInteractionMs = millis();
-    lastTouchMs = millis();
+    lastTouchMs        = millis();
+    lastHappyDecayMs   = millis();
+    nextBlinkMs        = millis() + random(2000, 5000);
     scheduleNextActivity(3000);
-    nextBlinkMs = millis() + random(2000, 5000);
   }
 
   void onEnter() {
-    currentActivity = ACT_IDLE;
-    neglected = false;
-    touchReaction = false;
+    // If returning from Flappy with a new high score, celebrate!
+    if (g_newHighScore) {
+      g_newHighScore = false;
+      setActivity(ACT_CELEBRATING);
+      touchReactionEndMs = millis() + 3000;
+      touchReaction = true;
+    } else {
+      currentActivity = ACT_IDLE;
+      neglected = false;
+      touchReaction = false;
+    }
     scheduleNextActivity(2000);
   }
 
   void onSingleTap() {
-    lastInteractionMs = millis();
-    lastTouchMs = millis();
-    neglected = false;
+    unsigned long now = millis();
 
-    // Pick a touch reaction
+    // Boost happiness on touch
+    g_happiness = constrain(g_happiness + 8, 0, 100);
+    lastTouchMs = now;
+    neglected   = false;
+
+    // If it's night and Mochi is sleeping, show groggy instead
+    bool isNight = (g_currentHour >= 22 || g_currentHour < 6);
+    if (isNight && (currentActivity == ACT_SLEEPING || neglected)) {
+      setActivity(ACT_NIGHT_GROGGY);
+      touchReaction     = true;
+      touchReactionEndMs = now + 2500;
+      return;
+    }
+
+    // Normal touch reaction
     int r = random(0, 3);
-    if (r == 0) currentActivity = ACT_TOUCHED_HAPPY;
-    else if (r == 1) currentActivity = ACT_TOUCHED_BLUSH;
-    else currentActivity = ACT_TOUCHED_GIGGLE;
+    if (r == 0)      setActivity(ACT_TOUCHED_HAPPY);
+    else if (r == 1) setActivity(ACT_TOUCHED_BLUSH);
+    else             setActivity(ACT_TOUCHED_GIGGLE);
 
-    touchReaction = true;
-    touchReactionEndMs = millis() + 2000;
-    activityStartMs = millis();
-    animFrame = 0;
+    touchReaction     = true;
+    touchReactionEndMs = now + 2000;
   }
 
   void update() {
@@ -278,41 +322,47 @@ public:
     if (now - lastFrameMs < 33) return;
     lastFrameMs = now;
 
-    // Check for neglect
-    unsigned long timeSinceTouch = now - lastTouchMs;
-    if (timeSinceTouch > NEGLECT_TIMEOUT && !neglected) {
-      neglected = true;
-      // Pick a neglect state randomly
-      int r = random(0, 4);
-      if (r == 0) currentActivity = ACT_SAD;
-      else if (r == 1) currentActivity = ACT_CRYING;
-      else if (r == 2) currentActivity = ACT_SLEEPING;
-      else currentActivity = ACT_LONELY;
-      activityStartMs = now;
-      animFrame = 0;
-      zCount = 0;
+    // ---- Happiness decay (1 point every 20s of no touch) ----
+    if (now - lastHappyDecayMs >= 20000) {
+      lastHappyDecayMs = now;
+      g_happiness = constrain(g_happiness - 1, 0, 100);
     }
 
-    // Touch reaction timeout
-    if (touchReaction && now > touchReactionEndMs) {
-      touchReaction = false;
-      neglected = false;
-      scheduleNextActivity(1000);
+    // ---- Night-time auto-sleep ----
+    bool isNight = (g_currentHour >= 22 || g_currentHour < 6);
+    if (isNight && !touchReaction) {
+      if (currentActivity != ACT_SLEEPING) {
+        setActivity(ACT_SLEEPING);
+        neglected = false;
+      }
+    } else {
+      // ---- Neglect detection ----
+      if (!neglected && (now - lastTouchMs) > NEGLECT_TIMEOUT) {
+        neglected = true;
+        int r = random(0, 4);
+        Activity neglectStates[] = { ACT_SAD, ACT_CRYING, ACT_SLEEPING, ACT_LONELY };
+        setActivity(neglectStates[r]);
+      }
+
+      // ---- Touch reaction timeout ----
+      if (touchReaction && now > touchReactionEndMs) {
+        touchReaction = false;
+        neglected     = false;
+        scheduleNextActivity(1000);
+      }
+
+      // ---- Autonomous activity scheduling ----
+      if (!neglected && !touchReaction && now >= nextActivityMs) {
+        setActivity(pickActivityByMood());
+        scheduleNextActivity(random(4000, 9000));
+      }
     }
 
-    // Schedule next autonomous activity (only if not neglected or in touch reaction)
-    if (!neglected && !touchReaction && now >= nextActivityMs) {
-      currentActivity = pickRandomActivity();
-      activityStartMs = now;
-      animFrame = 0;
-      scheduleNextActivity(random(4000, 9000));
-    }
-
-    // Blink logic (independent of activity for most states)
-    if (!blinking && now >= nextBlinkMs &&
-        currentActivity != ACT_SLEEPING &&
-        currentActivity != ACT_CRYING &&
-        currentActivity != ACT_WINKING) {
+    // ---- Blink logic ----
+    bool eyesCanBlink = (currentActivity != ACT_SLEEPING &&
+                         currentActivity != ACT_CRYING   &&
+                         currentActivity != ACT_WINKING);
+    if (!blinking && eyesCanBlink && now >= nextBlinkMs) {
       blinking = true;
       blinkStartMs = now;
     }
@@ -321,7 +371,7 @@ public:
       nextBlinkMs = now + random(2000, 5000);
     }
 
-    // Advance animation frames at ~100ms per frame
+    // ---- Advance animation sub-frames (~100ms each) ----
     if (now - lastAnimFrameMs > 100) {
       animFrame++;
       lastAnimFrameMs = now;
@@ -331,114 +381,121 @@ public:
   }
 
 private:
+  /* ------------------------------------------------------------------ */
+  void setActivity(Activity a) {
+    currentActivity  = a;
+    activityStartMs  = millis();
+    animFrame        = 0;
+    zCount           = 0;
+    dancePhase       = 0.0f;
+  }
+
   void scheduleNextActivity(unsigned long delayMs) {
     nextActivityMs = millis() + delayMs;
   }
 
-  Activity pickRandomActivity() {
-    // Weighted random pick from autonomous activities
-    Activity pool[] = {
-      ACT_IDLE, ACT_IDLE, ACT_IDLE,
-      ACT_WATCHING_PHONE,
-      ACT_DRINKING_COFFEE,
-      ACT_EATING,
-      ACT_YAWNING,
-      ACT_ROLLING_EYES,
-      ACT_WHISTLING,
-      ACT_POUTY,
-      ACT_BLANK_STARE,
-      ACT_BIG_GRIN,
-      ACT_THINKING,
-      ACT_STRETCHING,
-      ACT_DANCING,
-      ACT_WINKING,
-    };
-    int sz = sizeof(pool) / sizeof(pool[0]);
-    return pool[random(0, sz)];
+  /* ---- Mood-aware activity picker ---------------------------------- */
+  Activity pickActivityByMood() {
+    int h = g_happiness;
+
+    if (h < 25) {
+      // Very sad: only sad states
+      Activity pool[] = { ACT_SAD, ACT_CRYING, ACT_LONELY, ACT_BLANK_STARE, ACT_POUTY };
+      return pool[random(0, 5)];
+    } else if (h < 50) {
+      // Low mood: mostly neutral/sad
+      Activity pool[] = {
+        ACT_IDLE, ACT_BLANK_STARE, ACT_POUTY, ACT_THINKING,
+        ACT_SAD, ACT_LONELY, ACT_YAWNING, ACT_ROLLING_EYES
+      };
+      return pool[random(0, 8)];
+    } else if (h < 75) {
+      // Medium mood: balanced activities
+      Activity pool[] = {
+        ACT_IDLE, ACT_IDLE, ACT_WATCHING_PHONE, ACT_DRINKING_COFFEE,
+        ACT_EATING, ACT_THINKING, ACT_STRETCHING, ACT_YAWNING,
+        ACT_WHISTLING, ACT_ROLLING_EYES
+      };
+      return pool[random(0, 10)];
+    } else {
+      // High happiness: full range including celebrations
+      Activity pool[] = {
+        ACT_IDLE, ACT_WATCHING_PHONE, ACT_DRINKING_COFFEE,
+        ACT_EATING, ACT_YAWNING, ACT_WHISTLING,
+        ACT_BIG_GRIN, ACT_THINKING, ACT_STRETCHING,
+        ACT_DANCING, ACT_WINKING, ACT_BIG_GRIN
+      };
+      return pool[random(0, 12)];
+    }
   }
 
-  // Helper: draw a rounded rect eye with optional pupil offset
-  void drawEye(Adafruit_SH1106G& o, int x, int y, int w, int h, int pupilDx, int pupilDy, bool closed) {
+  /* ---- Eye helper -------------------------------------------------- */
+  void drawEye(Adafruit_SH1106G& o, int x, int y, int w, int h,
+               int pdx, int pdy, bool closed) {
     if (closed) {
-      // Draw as a horizontal line (closed eye)
-      o.drawFastHLine(x, y + h / 2, w, SSD1306_WHITE);
+      o.drawFastHLine(x, y + h / 2,     w, SSD1306_WHITE);
       o.drawFastHLine(x, y + h / 2 + 1, w, SSD1306_WHITE);
       return;
     }
     o.fillRoundRect(x, y, w, h, 4, SSD1306_WHITE);
-    // Pupil
-    int px = x + w / 2 + pupilDx - 2;
-    int py = y + h / 2 + pupilDy - 2;
-    px = constrain(px, x + 1, x + w - 4);
-    py = constrain(py, y + 1, y + h - 4);
+    int px = constrain(x + w / 2 + pdx - 2, x + 1, x + w - 4);
+    int py = constrain(y + h / 2 + pdy - 2, y + 1, y + h - 4);
     o.fillRect(px, py, 4, 4, SSD1306_BLACK);
   }
 
+  /* ---- Main draw --------------------------------------------------- */
   void draw(unsigned long now) {
     Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
 
     int bounce = (int)(1.5f * sinf(now / 500.0f));
-    int cx = 64; // center x
-    int baseY = 10 + bounce;
+    int cx     = 64;
+    int baseY  = 10 + bounce;
 
-    // Eye base positions
     int lEyeX = 36, rEyeX = 72;
-    int eyeY = baseY + 8;
-    int eyeW = 18, eyeH = 18;
-
-    // Default pupil offsets
-    int pupilDx = 0, pupilDy = 0;
+    int eyeY  = baseY + 8;
+    int eyeW  = 18, eyeH = 18;
 
     switch (currentActivity) {
 
+      /* ---------- IDLE ---------- */
       case ACT_IDLE: {
-        // Simple calm face
         drawEye(o, lEyeX, eyeY, eyeW, eyeH, 0, 0, blinking);
         drawEye(o, rEyeX, eyeY, eyeW, eyeH, 0, 0, blinking);
-        // Small smile
         o.drawLine(54, 42 + bounce, 58, 46 + bounce, SSD1306_WHITE);
-        o.drawLine(58, 46 + bounce, 70, 46 + bounce, SSD1306_WHITE);
-        o.drawLine(70, 46 + bounce, 74, 42 + bounce, SSD1306_WHITE);
+        o.drawFastHLine(58, 46 + bounce, 10, SSD1306_WHITE);
+        o.drawLine(68, 46 + bounce, 72, 42 + bounce, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- WATCHING PHONE ---------- */
       case ACT_WATCHING_PHONE: {
-        // Eyes looking down at a phone
         drawEye(o, lEyeX, eyeY + 4, eyeW, eyeH - 4, 0, 3, false);
         drawEye(o, rEyeX, eyeY + 4, eyeW, eyeH - 4, 0, 3, false);
-        // Phone rectangle below face
-        int ph = (animFrame % 2 == 0) ? 0 : 1; // subtle glow flicker
+        int ph = (animFrame % 2 == 0) ? 1 : 0;
         o.drawRect(44, 46 + bounce, 40, 14, SSD1306_WHITE);
         o.fillRect(46, 48 + bounce, 36, 10, ph ? SSD1306_WHITE : SSD1306_BLACK);
         if (!ph) {
-          // Draw tiny "screen content" lines
           o.drawFastHLine(48, 50 + bounce, 20, SSD1306_WHITE);
           o.drawFastHLine(48, 53 + bounce, 14, SSD1306_WHITE);
         }
-        // Neutral mouth
         o.drawFastHLine(58, 44 + bounce, 12, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- DRINKING COFFEE ---------- */
       case ACT_DRINKING_COFFEE: {
-        // Eyes half-closed content
         drawEye(o, lEyeX, eyeY + 5, eyeW, eyeH / 2, 0, 0, false);
         drawEye(o, rEyeX, eyeY + 5, eyeW, eyeH / 2, 0, 0, false);
-        // Small smile
         o.drawLine(55, 41 + bounce, 59, 44 + bounce, SSD1306_WHITE);
         o.drawFastHLine(59, 44 + bounce, 10, SSD1306_WHITE);
         o.drawLine(69, 44 + bounce, 73, 41 + bounce, SSD1306_WHITE);
-        // Coffee cup
-        int cf = animFrame % 4;
         o.drawRect(52, 48 + bounce, 24, 14, SSD1306_WHITE);
         o.drawFastHLine(50, 48 + bounce, 28, SSD1306_WHITE);
-        // Handle
         o.drawLine(76, 50 + bounce, 80, 50 + bounce, SSD1306_WHITE);
         o.drawLine(80, 50 + bounce, 80, 58 + bounce, SSD1306_WHITE);
         o.drawLine(76, 58 + bounce, 80, 58 + bounce, SSD1306_WHITE);
-        // Steam wisps
-        if (cf < 2) {
+        if (animFrame % 4 < 2) {
           o.drawPixel(58, 45 + bounce, SSD1306_WHITE);
           o.drawPixel(64, 44 + bounce, SSD1306_WHITE);
           o.drawPixel(70, 45 + bounce, SSD1306_WHITE);
@@ -446,192 +503,155 @@ private:
         break;
       }
 
+      /* ---------- EATING ---------- */
       case ACT_EATING: {
-        // Chewing animation - mouth opens and closes
         int phase = (animFrame / 2) % 3;
         drawEye(o, lEyeX, eyeY, eyeW, eyeH, 0, 0, blinking);
         drawEye(o, rEyeX, eyeY, eyeW, eyeH, 0, 0, blinking);
         if (phase == 0) {
-          // Mouth closed with food bulge in cheek
           o.fillRoundRect(52, 40 + bounce, 24, 6, 3, SSD1306_WHITE);
-          o.fillCircle(78, 43 + bounce, 4, SSD1306_WHITE); // food bulge
+          o.fillCircle(78, 43 + bounce, 4, SSD1306_WHITE);
         } else if (phase == 1) {
-          // Mouth slightly open
           o.fillRoundRect(52, 40 + bounce, 24, 8, 3, SSD1306_WHITE);
           o.fillRect(54, 42 + bounce, 20, 4, SSD1306_BLACK);
         } else {
-          // Mouth wide open with food
           o.fillRoundRect(52, 38 + bounce, 24, 12, 3, SSD1306_WHITE);
           o.fillRect(54, 40 + bounce, 20, 7, SSD1306_BLACK);
-          // Food item (small square)
           o.fillRect(58, 28 + bounce, 8, 8, SSD1306_WHITE);
-          o.drawRect(58, 28 + bounce, 8, 8, SSD1306_BLACK);
         }
-        // Cheeks for enjoying
         o.drawCircle(30, 38 + bounce, 4, SSD1306_WHITE);
         o.drawCircle(98, 38 + bounce, 4, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- YAWNING ---------- */
       case ACT_YAWNING: {
-        // Progressive yawn
         int phase = (animFrame / 3) % 6;
-        drawEye(o, lEyeX, eyeY + (phase > 2 ? 4 : 0), eyeW, eyeH, 0, 0,
-                phase > 2 ? true : blinking);
-        drawEye(o, rEyeX, eyeY + (phase > 2 ? 4 : 0), eyeW, eyeH, 0, 0,
-                phase > 2 ? true : blinking);
-        // Yawn mouth - opens wide
+        bool eyesClosed = (phase > 2);
+        drawEye(o, lEyeX, eyeY + (eyesClosed ? 4 : 0), eyeW,
+                eyesClosed ? eyeH - 4 : eyeH, 0, 0, eyesClosed);
+        drawEye(o, rEyeX, eyeY + (eyesClosed ? 4 : 0), eyeW,
+                eyesClosed ? eyeH - 4 : eyeH, 0, 0, eyesClosed);
         int mOpen = (phase < 3) ? phase * 4 : (5 - phase) * 4;
         mOpen = constrain(mOpen, 2, 16);
         o.fillRoundRect(52, 42 + bounce, 24, mOpen, 4, SSD1306_WHITE);
-        if (mOpen > 8) {
-          o.fillRoundRect(54, 44 + bounce, 20, mOpen - 4, 3, SSD1306_BLACK);
-        }
-        // Hand covering mouth during peak yawn
-        if (phase >= 2 && phase <= 4) {
+        if (mOpen > 8) o.fillRoundRect(54, 44 + bounce, 20, mOpen - 4, 3, SSD1306_BLACK);
+        if (phase >= 2 && phase <= 4)
           o.fillRoundRect(46, 44 + bounce, 36, 8, 4, SSD1306_WHITE);
-        }
         break;
       }
 
+      /* ---------- ROLLING EYES ---------- */
       case ACT_ROLLING_EYES: {
-        // Eyes rolling (pupils move in circle)
-        float angle = (animFrame * 0.4f);
+        float angle = animFrame * 0.4f;
         int pdx = (int)(5 * cosf(angle));
         int pdy = (int)(5 * sinf(angle));
         drawEye(o, lEyeX, eyeY, eyeW, eyeH, pdx, pdy, false);
         drawEye(o, rEyeX, eyeY, eyeW, eyeH, pdx, pdy, false);
-        // Flat/annoyed mouth
         o.drawFastHLine(55, 43 + bounce, 18, SSD1306_WHITE);
         o.drawFastHLine(55, 44 + bounce, 18, SSD1306_WHITE);
-        // Sweat drop
         o.fillTriangle(88, 20 + bounce, 92, 20 + bounce, 90, 26 + bounce, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- WHISTLING ---------- */
       case ACT_WHISTLING: {
-        // Eyes relaxed, mouth puckered
         drawEye(o, lEyeX, eyeY, eyeW, eyeH - 4, 0, 0, blinking);
         drawEye(o, rEyeX, eyeY, eyeW, eyeH - 4, 0, 0, blinking);
-        // Puckered mouth O
         int msize = 5 + (animFrame % 3);
         o.drawCircle(cx, 44 + bounce, msize, SSD1306_WHITE);
         o.drawCircle(cx, 44 + bounce, msize - 1, SSD1306_WHITE);
-        // Music notes floating
         if (animFrame % 6 < 3) {
           o.setCursor(90, 15 + bounce);
           o.setTextSize(1);
-          o.print("*");
+          o.print("~");
           o.setCursor(100, 22 + bounce);
-          o.print("*");
+          o.print("~");
         }
         break;
       }
 
+      /* ---------- POUTY ---------- */
       case ACT_POUTY: {
-        // Pouty sad-ish face 😒
-        // Half-closed eyes looking sideways
         drawEye(o, lEyeX, eyeY + 6, eyeW, eyeH / 2 + 2, -3, 0, false);
         drawEye(o, rEyeX, eyeY + 6, eyeW, eyeH / 2 + 2, -3, 0, false);
-        // Pouty mouth - bottom lip sticking out
         o.drawLine(52, 44 + bounce, 58, 46 + bounce, SSD1306_WHITE);
         o.drawFastHLine(58, 46 + bounce, 12, SSD1306_WHITE);
         o.drawLine(70, 46 + bounce, 76, 44 + bounce, SSD1306_WHITE);
         o.drawFastHLine(58, 47 + bounce, 12, SSD1306_WHITE);
-        // Little eyebrow furrow lines
         o.drawLine(36, eyeY - 4 + bounce, 54, eyeY - 6 + bounce, SSD1306_WHITE);
         o.drawLine(72, eyeY - 6 + bounce, 90, eyeY - 4 + bounce, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- BLANK STARE ---------- */
       case ACT_BLANK_STARE: {
-        // Completely blank stare 😑
-        // Flat line eyes
-        o.drawFastHLine(lEyeX, eyeY + eyeH / 2, eyeW, SSD1306_WHITE);
+        o.drawFastHLine(lEyeX, eyeY + eyeH / 2,     eyeW, SSD1306_WHITE);
         o.drawFastHLine(lEyeX, eyeY + eyeH / 2 + 1, eyeW, SSD1306_WHITE);
-        o.drawFastHLine(rEyeX, eyeY + eyeH / 2, eyeW, SSD1306_WHITE);
+        o.drawFastHLine(rEyeX, eyeY + eyeH / 2,     eyeW, SSD1306_WHITE);
         o.drawFastHLine(rEyeX, eyeY + eyeH / 2 + 1, eyeW, SSD1306_WHITE);
-        // Flat mouth
         o.drawFastHLine(56, 43 + bounce, 16, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- BIG GRIN ---------- */
       case ACT_BIG_GRIN: {
-        // Big happy grin 😁
-        // Wide happy eyes
         for (int t = 0; t < 3; t++) {
           o.drawLine(lEyeX, eyeY + eyeH, lEyeX + eyeW / 2, eyeY + t + 4, SSD1306_WHITE);
           o.drawLine(lEyeX + eyeW / 2, eyeY + t + 4, lEyeX + eyeW, eyeY + eyeH, SSD1306_WHITE);
           o.drawLine(rEyeX, eyeY + eyeH, rEyeX + eyeW / 2, eyeY + t + 4, SSD1306_WHITE);
           o.drawLine(rEyeX + eyeW / 2, eyeY + t + 4, rEyeX + eyeW, eyeY + eyeH, SSD1306_WHITE);
         }
-        // Big wide mouth showing teeth
         o.fillRoundRect(46, 38 + bounce, 36, 16, 5, SSD1306_WHITE);
         o.fillRect(48, 40 + bounce, 32, 8, SSD1306_BLACK);
-        // Teeth
-        for (int t = 0; t < 4; t++) {
+        for (int t = 0; t < 4; t++)
           o.fillRect(49 + t * 8, 40 + bounce, 6, 5, SSD1306_WHITE);
-        }
-        // Rosy cheeks
         for (int d = 0; d < 3; d++) {
-          o.drawCircle(28, 38 + bounce, d + 2, SSD1306_WHITE);
+          o.drawCircle(28,  38 + bounce, d + 2, SSD1306_WHITE);
           o.drawCircle(100, 38 + bounce, d + 2, SSD1306_WHITE);
         }
         break;
       }
 
+      /* ---------- THINKING ---------- */
       case ACT_THINKING: {
-        // Thinking - eyes looking up-right, hand on chin
         drawEye(o, lEyeX, eyeY, eyeW, eyeH, 3, -3, blinking);
         drawEye(o, rEyeX, eyeY, eyeW, eyeH, 3, -3, blinking);
-        // Slight smile
         o.drawLine(55, 43 + bounce, 58, 45 + bounce, SSD1306_WHITE);
         o.drawFastHLine(58, 45 + bounce, 12, SSD1306_WHITE);
-        // Hand/fist at chin
         o.fillRoundRect(56, 48 + bounce, 20, 10, 3, SSD1306_WHITE);
-        // Thought bubble dots
         int tb = (animFrame / 3) % 4;
-        for (int i = 0; i <= tb && i < 3; i++) {
+        for (int i = 0; i <= tb && i < 3; i++)
           o.fillCircle(85 + i * 8, 12 + bounce - i * 3, 2 + i, SSD1306_WHITE);
-        }
         break;
       }
 
+      /* ---------- STRETCHING ---------- */
       case ACT_STRETCHING: {
-        // Stretching arms wide
         int phase = (animFrame / 4) % 4;
         drawEye(o, lEyeX, eyeY + 3, eyeW, eyeH - 6, 0, 0, true);
         drawEye(o, rEyeX, eyeY + 3, eyeW, eyeH - 6, 0, 0, true);
-        // Squished face (eyes closed)
-        // Wide mouth
         int mw = 12 + phase * 4;
         o.drawFastHLine(cx - mw / 2, 44 + bounce, mw, SSD1306_WHITE);
-        // Arms stretching out
-        int armLen = 10 + phase * 8;
-        armLen = constrain(armLen, 10, 40);
+        int armLen = constrain(10 + phase * 8, 10, 40);
         o.drawLine(lEyeX - 2, 36 + bounce, lEyeX - 2 - armLen, 30 + bounce, SSD1306_WHITE);
         o.drawLine(rEyeX + eyeW + 2, 36 + bounce, rEyeX + eyeW + 2 + armLen, 30 + bounce, SSD1306_WHITE);
-        // Little hand circles
         o.fillCircle(lEyeX - 2 - armLen, 30 + bounce, 3, SSD1306_WHITE);
         o.fillCircle(rEyeX + eyeW + 2 + armLen, 30 + bounce, 3, SSD1306_WHITE);
         break;
       }
 
+      /* ---------- DANCING ---------- */
       case ACT_DANCING: {
-        // Bouncy dance!
         dancePhase += 0.3f;
-        int db = (int)(4 * sinf(dancePhase));
-        int db2 = (int)(4 * cosf(dancePhase));
-        // Alternating eyes grow/shrink slightly
+        int db  = (int)(4 * sinf(dancePhase));
         int ley = eyeY + (db > 0 ? 0 : 2);
         int rey = eyeY + (db > 0 ? 2 : 0);
         drawEye(o, lEyeX + db / 2, ley, eyeW, eyeH, 0, 0, false);
         drawEye(o, rEyeX + db / 2, rey, eyeW, eyeH, 0, 0, false);
-        // Happy mouth
         o.drawLine(52, 43 + bounce + db / 2, 57, 47 + bounce + db / 2, SSD1306_WHITE);
         o.drawFastHLine(57, 47 + bounce + db / 2, 14, SSD1306_WHITE);
         o.drawLine(71, 47 + bounce + db / 2, 76, 43 + bounce + db / 2, SSD1306_WHITE);
-        // Music notes
         if ((int)(dancePhase * 2) % 4 < 2) {
           o.setCursor(14, 20);
           o.setTextSize(1);
@@ -642,104 +662,78 @@ private:
         break;
       }
 
+      /* ---------- WINKING ---------- */
       case ACT_WINKING: {
-        // Wink - left eye normal, right eye closed with curve
         drawEye(o, lEyeX, eyeY, eyeW, eyeH, 0, 0, false);
-        // Right eye wink (curved line)
         for (int i = 0; i < 3; i++) {
-          o.drawLine(rEyeX, eyeY + 12 + i, rEyeX + eyeW / 2, eyeY + 6 + i, SSD1306_WHITE);
-          o.drawLine(rEyeX + eyeW / 2, eyeY + 6 + i, rEyeX + eyeW, eyeY + 12 + i, SSD1306_WHITE);
+          o.drawLine(rEyeX,           eyeY + 12 + i, rEyeX + eyeW / 2, eyeY + 6 + i, SSD1306_WHITE);
+          o.drawLine(rEyeX + eyeW / 2, eyeY + 6 + i, rEyeX + eyeW,     eyeY + 12 + i, SSD1306_WHITE);
         }
-        // Cheeky smile
         o.drawLine(54, 42 + bounce, 58, 46 + bounce, SSD1306_WHITE);
         o.drawFastHLine(58, 46 + bounce, 12, SSD1306_WHITE);
         o.drawLine(70, 46 + bounce, 76, 42 + bounce, SSD1306_WHITE);
         break;
       }
 
-      // ---- NEGLECT STATES ----
-
+      /* ---------- SAD ---------- */
       case ACT_SAD: {
-        // Sad droopy eyes
-        // Eyes look down with sad brows
         drawEye(o, lEyeX, eyeY + 4, eyeW, eyeH - 4, 0, 3, blinking);
         drawEye(o, rEyeX, eyeY + 4, eyeW, eyeH - 4, 0, 3, blinking);
-        // Sad angled brows
-        o.drawLine(lEyeX, eyeY - 4 + bounce, lEyeX + eyeW, eyeY + bounce, SSD1306_WHITE);
-        o.drawLine(rEyeX, eyeY + bounce, rEyeX + eyeW, eyeY - 4 + bounce, SSD1306_WHITE);
-        // Sad frown
+        o.drawLine(lEyeX,           eyeY - 4 + bounce, lEyeX + eyeW, eyeY + bounce, SSD1306_WHITE);
+        o.drawLine(rEyeX,           eyeY + bounce,     rEyeX + eyeW, eyeY - 4 + bounce, SSD1306_WHITE);
         o.drawLine(52, 46 + bounce, 57, 42 + bounce, SSD1306_WHITE);
         o.drawFastHLine(57, 42 + bounce, 14, SSD1306_WHITE);
         o.drawLine(71, 42 + bounce, 76, 46 + bounce, SSD1306_WHITE);
-        // "...?" text
         dm->centerText("...", 56, 1);
         break;
       }
 
+      /* ---------- CRYING ---------- */
       case ACT_CRYING: {
-        // Crying face with falling tears
-        // Teary squinted eyes
-        // Eye squeezed shut wavy
         for (int i = 0; i < 3; i++) {
           o.drawLine(lEyeX + i * 3, eyeY + 10, lEyeX + i * 3 + 2, eyeY + 7, SSD1306_WHITE);
           o.drawLine(rEyeX + i * 3, eyeY + 10, rEyeX + i * 3 + 2, eyeY + 7, SSD1306_WHITE);
         }
         o.drawFastHLine(lEyeX, eyeY + 10, eyeW, SSD1306_WHITE);
         o.drawFastHLine(rEyeX, eyeY + 10, eyeW, SSD1306_WHITE);
-        // Sad brows
-        o.drawLine(lEyeX, eyeY - 2 + bounce, lEyeX + eyeW, eyeY + 2 + bounce, SSD1306_WHITE);
-        o.drawLine(rEyeX, eyeY + 2 + bounce, rEyeX + eyeW, eyeY - 2 + bounce, SSD1306_WHITE);
-        // Tears falling
-        tearY1 = eyeY + 14 + (animFrame * 2) % 30;
-        tearY2 = eyeY + 14 + (animFrame * 2 + 15) % 30;
-        o.fillRoundRect(lEyeX + 6, tearY1 + bounce, 4, 6, 2, SSD1306_WHITE);
-        o.fillRoundRect(rEyeX + 6, tearY2 + bounce, 4, 6, 2, SSD1306_WHITE);
-        // Big frown
+        o.drawLine(lEyeX,           eyeY - 2 + bounce, lEyeX + eyeW, eyeY + 2 + bounce, SSD1306_WHITE);
+        o.drawLine(rEyeX,           eyeY + 2 + bounce, rEyeX + eyeW, eyeY - 2 + bounce, SSD1306_WHITE);
+        int t1 = eyeY + 14 + (animFrame * 2) % 30;
+        int t2 = eyeY + 14 + (animFrame * 2 + 15) % 30;
+        o.fillRoundRect(lEyeX + 6, t1 + bounce, 4, 6, 2, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX + 6, t2 + bounce, 4, 6, 2, SSD1306_WHITE);
         o.drawLine(50, 48 + bounce, 56, 44 + bounce, SSD1306_WHITE);
         o.drawFastHLine(56, 44 + bounce, 16, SSD1306_WHITE);
         o.drawLine(72, 44 + bounce, 78, 48 + bounce, SSD1306_WHITE);
-        // Sob text
-        if (animFrame % 6 < 3) {
-          dm->centerText("(T_T)", 56, 1);
-        }
+        if (animFrame % 6 < 3) dm->centerText("(T_T)", 56, 1);
         break;
       }
 
+      /* ---------- SLEEPING ---------- */
       case ACT_SLEEPING: {
-        // Sleeping with ZZZ
-        // Eyes closed as curved lines
+        // Curved closed eyes
         for (int i = 0; i < 3; i++) {
-          o.drawLine(lEyeX + i * 3, eyeY + 9 + bounce, lEyeX + 3 + i * 3, eyeY + 6 + bounce, SSD1306_WHITE);
-        }
-        for (int i = 0; i < 3; i++) {
-          o.drawLine(rEyeX + i * 3, eyeY + 9 + bounce, rEyeX + 3 + i * 3, eyeY + 6 + bounce, SSD1306_WHITE);
+          o.drawLine(lEyeX + i * 3, eyeY + 9 + bounce, lEyeX + i * 3 + 2, eyeY + 6 + bounce, SSD1306_WHITE);
+          o.drawLine(rEyeX + i * 3, eyeY + 9 + bounce, rEyeX + i * 3 + 2, eyeY + 6 + bounce, SSD1306_WHITE);
         }
         o.drawFastHLine(lEyeX, eyeY + 9 + bounce, eyeW, SSD1306_WHITE);
         o.drawFastHLine(rEyeX, eyeY + 9 + bounce, eyeW, SSD1306_WHITE);
-        // Sleepy mouth (small)
         o.drawFastHLine(59, 43 + bounce, 10, SSD1306_WHITE);
-        // ZZZ floating up
-        if (now - lastZMs > 800) {
-          lastZMs = now;
-          zCount = (zCount + 1) % 4;
-        }
+        // ZZZ
+        if (millis() - lastZMs > 800) { lastZMs = millis(); zCount = (zCount + 1) % 4; }
         for (int z = 0; z < zCount; z++) {
-          int zx = 78 + z * 7;
-          int zy = 20 - z * 7;
-          o.setCursor(zx, zy + bounce);
+          o.setCursor(78 + z * 7, 20 - z * 7 + bounce);
           o.setTextSize(1);
           o.print("z");
         }
         break;
       }
 
+      /* ---------- LONELY ---------- */
       case ACT_LONELY: {
-        // Lonely - looking sideways with a sigh
         drawEye(o, lEyeX, eyeY + 3, eyeW, eyeH - 4, -4, 2, blinking);
         drawEye(o, rEyeX, eyeY + 3, eyeW, eyeH - 4, -4, 2, blinking);
-        // Flat sad mouth
         o.drawFastHLine(54, 44 + bounce, 20, SSD1306_WHITE);
-        // Sigh lines
         if (animFrame % 8 < 4) {
           o.drawLine(30, 30 + bounce, 20, 20 + bounce, SSD1306_WHITE);
           o.drawLine(20, 20 + bounce, 25, 18 + bounce, SSD1306_WHITE);
@@ -748,23 +742,18 @@ private:
         break;
       }
 
-      // ---- TOUCH REACTIONS ----
-
+      /* ---------- TOUCHED HAPPY ---------- */
       case ACT_TOUCHED_HAPPY: {
-        // Very happy from touch! Bouncy stars
         for (int t = 0; t < 3; t++) {
           o.drawLine(lEyeX, eyeY + eyeH, lEyeX + eyeW / 2, eyeY + t + 3, SSD1306_WHITE);
           o.drawLine(lEyeX + eyeW / 2, eyeY + t + 3, lEyeX + eyeW, eyeY + eyeH, SSD1306_WHITE);
           o.drawLine(rEyeX, eyeY + eyeH, rEyeX + eyeW / 2, eyeY + t + 3, SSD1306_WHITE);
           o.drawLine(rEyeX + eyeW / 2, eyeY + t + 3, rEyeX + eyeW, eyeY + eyeH, SSD1306_WHITE);
         }
-        // Big smile
         o.drawLine(48, 43 + bounce, 54, 48 + bounce, SSD1306_WHITE);
         o.drawFastHLine(54, 48 + bounce, 20, SSD1306_WHITE);
         o.drawLine(74, 48 + bounce, 80, 43 + bounce, SSD1306_WHITE);
-        // Sparkles
-        int sp = animFrame % 8;
-        if (sp < 4) {
+        if (animFrame % 8 < 4) {
           o.drawLine(20, 10, 24, 10, SSD1306_WHITE);
           o.drawLine(22, 8, 22, 12, SSD1306_WHITE);
           o.drawLine(100, 18, 104, 18, SSD1306_WHITE);
@@ -774,51 +763,86 @@ private:
         break;
       }
 
+      /* ---------- TOUCHED BLUSH ---------- */
       case ACT_TOUCHED_BLUSH: {
-        // Blushing from touch
         drawEye(o, lEyeX, eyeY + 2, eyeW, eyeH - 4, 0, 0, false);
         drawEye(o, rEyeX, eyeY + 2, eyeW, eyeH - 4, 0, 0, false);
-        // Small shy smile
         o.drawLine(56, 44 + bounce, 60, 46 + bounce, SSD1306_WHITE);
         o.drawFastHLine(60, 46 + bounce, 8, SSD1306_WHITE);
         o.drawLine(68, 46 + bounce, 72, 44 + bounce, SSD1306_WHITE);
-        // Big blush circles
-        for (int r = 2; r <= 6; r++) {
-          if (r % 2 == 0) {
-            o.drawCircle(26, 38 + bounce, r, SSD1306_WHITE);
-            o.drawCircle(102, 38 + bounce, r, SSD1306_WHITE);
-          }
+        for (int r = 2; r <= 6; r += 2) {
+          o.drawCircle(26,  38 + bounce, r, SSD1306_WHITE);
+          o.drawCircle(102, 38 + bounce, r, SSD1306_WHITE);
         }
-        // Shy text
-        if (animFrame % 6 < 3) {
-          dm->centerText(">////<", 56, 1);
-        } else {
-          dm->centerText("      ", 56, 1);
-        }
+        if (animFrame % 6 < 3) dm->centerText(">////<", 56, 1);
         break;
       }
 
+      /* ---------- TOUCHED GIGGLE ---------- */
       case ACT_TOUCHED_GIGGLE: {
-        // Giggling!
         int gb = (animFrame % 2 == 0) ? 2 : -2;
         for (int t = 0; t < 3; t++) {
-          o.drawLine(lEyeX, eyeY + eyeH + gb, lEyeX + eyeW / 2, eyeY + t + 5 + gb, SSD1306_WHITE);
-          o.drawLine(lEyeX + eyeW / 2, eyeY + t + 5 + gb, lEyeX + eyeW, eyeY + eyeH + gb, SSD1306_WHITE);
-          o.drawLine(rEyeX, eyeY + eyeH + gb, rEyeX + eyeW / 2, eyeY + t + 5 + gb, SSD1306_WHITE);
-          o.drawLine(rEyeX + eyeW / 2, eyeY + t + 5 + gb, rEyeX + eyeW, eyeY + eyeH + gb, SSD1306_WHITE);
+          o.drawLine(lEyeX,           eyeY + eyeH + gb, lEyeX + eyeW / 2, eyeY + t + 5 + gb, SSD1306_WHITE);
+          o.drawLine(lEyeX + eyeW / 2, eyeY + t + 5 + gb, lEyeX + eyeW,   eyeY + eyeH + gb, SSD1306_WHITE);
+          o.drawLine(rEyeX,           eyeY + eyeH + gb, rEyeX + eyeW / 2, eyeY + t + 5 + gb, SSD1306_WHITE);
+          o.drawLine(rEyeX + eyeW / 2, eyeY + t + 5 + gb, rEyeX + eyeW,   eyeY + eyeH + gb, SSD1306_WHITE);
         }
-        // Laugh mouth open
         o.fillRoundRect(50, 39 + bounce + gb, 28, 14, 5, SSD1306_WHITE);
-        o.fillRect(52, 41 + bounce + gb, 24, 8, SSD1306_BLACK);
-        // Hehe text bouncing
-        if (animFrame % 4 < 2) {
-          dm->centerText("hehe~", 55, 1);
-        }
+        o.fillRect(52,     41 + bounce + gb, 24, 8, SSD1306_BLACK);
+        if (animFrame % 4 < 2) dm->centerText("hehe~", 55, 1);
         break;
       }
 
-      default:
+      /* ---------- CELEBRATING (new high score) ---------- */
+      case ACT_CELEBRATING: {
+        // Huge eyes, confetti dots, party text
+        dancePhase += 0.5f;
+        int db = (int)(5 * sinf(dancePhase));
+        for (int t = 0; t < 3; t++) {
+          o.drawLine(lEyeX, eyeY + eyeH + db, lEyeX + eyeW / 2, eyeY + t + 2 + db, SSD1306_WHITE);
+          o.drawLine(lEyeX + eyeW / 2, eyeY + t + 2 + db, lEyeX + eyeW, eyeY + eyeH + db, SSD1306_WHITE);
+          o.drawLine(rEyeX, eyeY + eyeH + db, rEyeX + eyeW / 2, eyeY + t + 2 + db, SSD1306_WHITE);
+          o.drawLine(rEyeX + eyeW / 2, eyeY + t + 2 + db, rEyeX + eyeW, eyeY + eyeH + db, SSD1306_WHITE);
+        }
+        o.fillRoundRect(44, 38 + bounce + db, 40, 14, 5, SSD1306_WHITE);
+        o.fillRect(46, 40 + bounce + db, 36, 8, SSD1306_BLACK);
+        for (int t = 0; t < 4; t++)
+          o.fillRect(47 + t * 9, 40 + bounce + db, 7, 5, SSD1306_WHITE);
+        // Confetti
+        for (int c = 0; c < 8; c++) {
+          int cx2 = (c * 17 + animFrame * 3) % 128;
+          int cy2 = (c * 11 + animFrame * 2) % 30;
+          o.drawPixel(cx2, cy2, SSD1306_WHITE);
+          o.fillRect(cx2, cy2, 2, 2, SSD1306_WHITE);
+        }
+        dm->centerText("NEW BEST!", 56, 1);
         break;
+      }
+
+      /* ---------- NIGHT GROGGY ---------- */
+      case ACT_NIGHT_GROGGY: {
+        // Half-open annoyed eyes, messy hair implied by jagged top
+        drawEye(o, lEyeX, eyeY + 8, eyeW, eyeH / 2 - 2, 0, 0, false);
+        drawEye(o, rEyeX, eyeY + 8, eyeW, eyeH / 2 - 2, 0, 0, false);
+        // Heavy eyelids
+        o.fillRect(lEyeX, eyeY + 8, eyeW, 5, SSD1306_BLACK);
+        o.fillRect(rEyeX, eyeY + 8, eyeW, 5, SSD1306_BLACK);
+        o.drawFastHLine(lEyeX, eyeY + 13, eyeW, SSD1306_WHITE);
+        o.drawFastHLine(rEyeX, eyeY + 13, eyeW, SSD1306_WHITE);
+        // Annoyed flat mouth
+        o.drawFastHLine(55, 43 + bounce, 18, SSD1306_WHITE);
+        // Angry brows
+        o.drawLine(lEyeX,           eyeY + 4 + bounce, lEyeX + eyeW, eyeY + bounce, SSD1306_WHITE);
+        o.drawLine(rEyeX,           eyeY + bounce,     rEyeX + eyeW, eyeY + 4 + bounce, SSD1306_WHITE);
+        // "Zzz..." indicator
+        o.setCursor(85, 8 + bounce);
+        o.setTextSize(1);
+        o.print("zzz");
+        dm->centerText("...go away", 54, 1);
+        break;
+      }
+
+      default: break;
     }
 
     o.display();
@@ -828,12 +852,10 @@ private:
 /* ============================ WatchApp ============================== */
 class WatchApp {
   DisplayManager* dm;
-  TimeManager* tm;
+  TimeManager*    tm;
   int lastSecond = -1;
 public:
-  void begin(DisplayManager* d, TimeManager* t) {
-    dm = d; tm = t;
-  }
+  void begin(DisplayManager* d, TimeManager* t) { dm = d; tm = t; }
   void onEnter() { lastSecond = -1; }
 
   void update() {
@@ -868,118 +890,288 @@ public:
 class FlappyApp {
   DisplayManager* dm;
   Preferences prefs;
+
 public:
-  enum GState { G_START, G_PLAYING, G_OVER };
+  enum GState { G_START, G_READY, G_PLAYING, G_OVER };
   GState gstate = G_START;
+
 private:
-  float birdY = 32, birdV = 0;
-  static constexpr int BIRD_X = 24, BIRD_R = 3;
-  static constexpr float GRAVITY = 0.28f, FLAP_V = -2.9f;
-  static constexpr int NPIPES = 3, PIPE_W = 12, GAP_H = 26, PIPE_SPACING = 52;
-  int pipeX[NPIPES], gapY[NPIPES];
+  /* Bird */
+  float birdY  = 32.0f;
+  float birdV  = 0.0f;
+  static constexpr int   BIRD_X = 28;
+  static constexpr int   BIRD_R = 4;
+
+  /* Physics — tuned for playability */
+  static constexpr float GRAVITY    = 0.20f;  // gentle fall
+  static constexpr float FLAP_V     = -2.6f;  // comfortable flap lift
+  static constexpr float MAX_FALL_V = 3.5f;   // terminal velocity cap
+
+  /* Pipes */
+  static constexpr int NPIPES       = 3;
+  static constexpr int PIPE_W       = 10;
+  static constexpr int GAP_H        = 30;     // generous gap
+  static constexpr int PIPE_SPACING = 55;
+  static constexpr int PIPE_SPEED   = 2;
+
+  int  pipeX[NPIPES];
+  int  gapY[NPIPES];
   bool passed[NPIPES];
-  int score = 0, best = 0;
+
+  int  score    = 0;
+  int  best     = 0;
+  bool newBest  = false;
+
   unsigned long lastFrameMs = 0;
   bool dirty = true;
+
+  /* Grace period: bird floats for 1.2s before gravity kicks in */
+  bool          graceActive    = false;
+  unsigned long graceStartMs   = 0;
+  static constexpr unsigned long GRACE_MS = 1200;
+
+  /* Pipe scroll-in: first pipe starts further right for breathing room */
+  static constexpr int FIRST_PIPE_OFFSET = 80;
+
 public:
   void begin(DisplayManager* d) {
     dm = d;
     prefs.begin("flappy", false);
     best = prefs.getInt("best", 0);
   }
-  void onEnter() { gstate = G_START; dirty = true; }
-  bool isPlaying() const { return gstate == G_PLAYING; }
+
+  void onEnter() { gstate = G_START; dirty = true; newBest = false; }
+  bool isPlaying() const { return gstate == G_PLAYING || gstate == G_READY; }
 
   void onSingleTap() {
-    if (gstate == G_START)        startGame();
-    else if (gstate == G_PLAYING) birdV = FLAP_V;
-    else                          startGame();
-  }
-
-  void startGame() {
-    birdY = 32; birdV = 0; score = 0;
-    for (int i = 0; i < NPIPES; i++) {
-      pipeX[i] = 128 + i * PIPE_SPACING;
-      gapY[i]  = random(10, 64 - 10 - GAP_H);
-      passed[i] = false;
+    switch (gstate) {
+      case G_START:
+        initGame();
+        gstate = G_READY;
+        dirty  = false;
+        break;
+      case G_READY:
+        // First tap launches bird and starts gravity
+        gstate      = G_PLAYING;
+        graceActive = false;
+        birdV       = FLAP_V;
+        break;
+      case G_PLAYING:
+        birdV = FLAP_V;
+        break;
+      case G_OVER:
+        initGame();
+        gstate = G_READY;
+        dirty  = false;
+        break;
     }
-    gstate = G_PLAYING;
   }
 
   void update() {
     unsigned long now = millis();
-    if (now - lastFrameMs < 33) return;
+    if (now - lastFrameMs < 33) return;   // ~30 fps
     lastFrameMs = now;
 
-    if (gstate == G_START)   { if (dirty) { drawStart(); dirty = false; } return; }
-    if (gstate == G_OVER)    { if (dirty) { drawGameOver(); dirty = false; } return; }
+    switch (gstate) {
+      case G_START:
+        if (dirty) { drawStart(); dirty = false; }
+        break;
 
-    birdV += GRAVITY;
-    birdY += birdV;
+      case G_READY:
+        // Bird bobs in place, pipes are frozen, waiting for first tap
+        birdY = 32.0f + 3.0f * sinf(now / 400.0f);
+        drawReadyScreen(now);
+        break;
+
+      case G_PLAYING:
+        tickPhysics();
+        scrollPipes();
+        if (checkCollision()) {
+          handleDeath();
+        } else {
+          drawGame();
+        }
+        break;
+
+      case G_OVER:
+        if (dirty) { drawGameOver(); dirty = false; }
+        break;
+    }
+  }
+
+private:
+  void initGame() {
+    birdY      = 32.0f;
+    birdV      = 0.0f;
+    score      = 0;
+    newBest    = false;
+    graceActive = true;
+    graceStartMs = millis();
 
     for (int i = 0; i < NPIPES; i++) {
-      pipeX[i] -= 2;
+      // Stagger pipes across screen with generous first-pipe offset
+      pipeX[i]  = 128 + FIRST_PIPE_OFFSET + i * PIPE_SPACING;
+      gapY[i]   = random(8, 64 - 8 - GAP_H);
+      passed[i] = false;
+    }
+  }
+
+  void tickPhysics() {
+    // Grace period: no gravity, bird just drifts
+    if (graceActive) {
+      if (millis() - graceStartMs < GRACE_MS) {
+        birdY = 32.0f + 2.0f * sinf(millis() / 300.0f);
+        return;
+      }
+      graceActive = false;
+    }
+    birdV += GRAVITY;
+    birdV  = constrain(birdV, FLAP_V * 1.2f, MAX_FALL_V);
+    birdY += birdV;
+    birdY  = constrain(birdY, (float)BIRD_R, 63.0f - BIRD_R);
+  }
+
+  void scrollPipes() {
+    for (int i = 0; i < NPIPES; i++) {
+      pipeX[i] -= PIPE_SPEED;
+
+      // Recycle pipe that has fully left screen
       if (pipeX[i] + PIPE_W < 0) {
-        pipeX[i] = pipeX[(i + NPIPES - 1) % NPIPES] + PIPE_SPACING;
-        gapY[i]  = random(10, 64 - 10 - GAP_H);
+        // Place it after the rightmost active pipe
+        int rightmost = pipeX[0];
+        for (int j = 1; j < NPIPES; j++)
+          if (pipeX[j] > rightmost) rightmost = pipeX[j];
+
+        pipeX[i]  = rightmost + PIPE_SPACING;
+        gapY[i]   = random(8, 64 - 8 - GAP_H);
         passed[i] = false;
       }
-      if (!passed[i] && pipeX[i] + PIPE_W < BIRD_X - BIRD_R) {
+
+      // Score when bird clears a pipe
+      if (!passed[i] && (pipeX[i] + PIPE_W) < (BIRD_X - BIRD_R)) {
         passed[i] = true;
         score++;
+        // Small happiness boost for each pipe cleared
+        g_happiness = constrain(g_happiness + 3, 0, 100);
       }
     }
+  }
 
-    bool dead = (birdY - BIRD_R <= 0) || (birdY + BIRD_R >= 63);
-    for (int i = 0; i < NPIPES && !dead; i++) {
-      bool inX = (BIRD_X + BIRD_R > pipeX[i]) && (BIRD_X - BIRD_R < pipeX[i] + PIPE_W);
-      bool inGap = (birdY - BIRD_R > gapY[i]) && (birdY + BIRD_R < gapY[i] + GAP_H);
-      if (inX && !inGap) dead = true;
+  bool checkCollision() {
+    // Ceiling / floor
+    if (birdY - BIRD_R <= 0 || birdY + BIRD_R >= 63) return true;
+
+    // Pipe collision (AABB vs circle approximation)
+    for (int i = 0; i < NPIPES; i++) {
+      bool inX = (BIRD_X + BIRD_R - 1 > pipeX[i]) &&
+                 (BIRD_X - BIRD_R + 1 < pipeX[i] + PIPE_W);
+      if (!inX) continue;
+      bool inGap = ((int)birdY - BIRD_R + 1 > gapY[i]) &&
+                   ((int)birdY + BIRD_R - 1 < gapY[i] + GAP_H);
+      if (!inGap) return true;
     }
-    if (dead) {
-      if (score > best) { best = score; prefs.putInt("best", best); }
-      gstate = G_OVER; dirty = true;
-      return;
+    return false;
+  }
+
+  void handleDeath() {
+    if (score > best) {
+      best    = score;
+      newBest = true;
+      prefs.putInt("best", best);
+      g_newHighScore = true;   // signal MochiApp
+      g_happiness    = constrain(g_happiness + 20, 0, 100);
     }
-    drawGame();
+    gstate = G_OVER;
+    dirty  = true;
+  }
+
+  /* ---- Draw helpers ---- */
+  void drawBird() {
+    Adafruit_SH1106G& o = dm->oled;
+    int by = (int)birdY;
+    o.fillCircle(BIRD_X, by, BIRD_R, SSD1306_WHITE);
+    // Eye
+    o.drawPixel(BIRD_X + 2, by - 1, SSD1306_BLACK);
+    // Wing flap
+    if (birdV < -0.5f) {
+      o.drawLine(BIRD_X - 3, by,     BIRD_X - 6, by - 3, SSD1306_WHITE);
+      o.drawLine(BIRD_X - 6, by - 3, BIRD_X - 3, by - 1, SSD1306_WHITE);
+    } else {
+      o.drawLine(BIRD_X - 3, by, BIRD_X - 6, by + 2, SSD1306_WHITE);
+      o.drawLine(BIRD_X - 6, by + 2, BIRD_X - 3, by + 1, SSD1306_WHITE);
+    }
+  }
+
+  void drawPipes() {
+    Adafruit_SH1106G& o = dm->oled;
+    for (int i = 0; i < NPIPES; i++) {
+      int px = pipeX[i];
+      if (px > 128 || px + PIPE_W < 0) continue;  // off-screen skip
+
+      // Top pipe
+      o.fillRect(px, 0, PIPE_W, gapY[i], SSD1306_WHITE);
+      // Pipe cap (bottom of top pipe)
+      o.fillRect(px - 1, gapY[i] - 3, PIPE_W + 2, 3, SSD1306_WHITE);
+
+      // Bottom pipe
+      int botTop = gapY[i] + GAP_H;
+      // Pipe cap (top of bottom pipe)
+      o.fillRect(px - 1, botTop, PIPE_W + 2, 3, SSD1306_WHITE);
+      o.fillRect(px, botTop + 3, PIPE_W, 64 - botTop - 3, SSD1306_WHITE);
+    }
   }
 
   void drawStart() {
     Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
-    dm->centerText("FLAPPY BIRD", 10, 1);
-    o.drawRoundRect(34, 28, 60, 16, 4, SSD1306_WHITE);
-    dm->centerText("START", 32, 1);
-    dm->centerText("tap to play", 54, 1);
+    dm->centerText("FLAPPY BIRD", 6, 1);
+    // Demo bird
+    o.fillCircle(64, 30, BIRD_R, SSD1306_WHITE);
+    o.drawPixel(66, 29, SSD1306_BLACK);
+    o.drawRoundRect(30, 42, 68, 14, 4, SSD1306_WHITE);
+    dm->centerText("Tap to Start", 46, 1);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "Best: %d", best);
+    dm->centerText(buf, 56, 1);
+    o.display();
+  }
+
+  void drawReadyScreen(unsigned long now) {
+    Adafruit_SH1106G& o = dm->oled;
+    o.clearDisplay();
+    drawPipes();
+    drawBird();
+    o.drawFastHLine(0, 63, 128, SSD1306_WHITE);
+    dm->centerText("TAP TO FLY!", 2, 1);
     o.display();
   }
 
   void drawGame() {
     Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
-    for (int i = 0; i < NPIPES; i++) {
-      o.fillRect(pipeX[i], 0, PIPE_W, gapY[i], SSD1306_WHITE);
-      o.fillRect(pipeX[i], gapY[i] + GAP_H, PIPE_W, 64 - gapY[i] - GAP_H, SSD1306_WHITE);
-    }
+    drawPipes();
+    drawBird();
     o.drawFastHLine(0, 63, 128, SSD1306_WHITE);
-    o.fillCircle(BIRD_X, (int)birdY, BIRD_R, SSD1306_WHITE);
-    o.drawPixel(BIRD_X + 2, (int)birdY - 1, SSD1306_BLACK);
+    // Score
     char buf[8];
     snprintf(buf, sizeof(buf), "%d", score);
-    dm->centerText(buf, 0, 1);
+    dm->centerText(buf, 2, 1);
     o.display();
   }
 
   void drawGameOver() {
     Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
-    dm->centerText("GAME OVER", 8, 1);
-    char buf[20];
+    dm->centerText("GAME OVER", 4, 1);
+    char buf[24];
     snprintf(buf, sizeof(buf), "Score: %d", score);
-    dm->centerText(buf, 26, 1);
+    dm->centerText(buf, 20, 1);
     snprintf(buf, sizeof(buf), "Best:  %d", best);
-    dm->centerText(buf, 38, 1);
-    dm->centerText("tap to retry", 54, 1);
+    dm->centerText(buf, 32, 1);
+    if (newBest) {
+      dm->centerText("** NEW BEST! **", 44, 1);
+    }
+    dm->centerText("Tap to retry", 54, 1);
     o.display();
   }
 };
@@ -987,15 +1179,19 @@ public:
 /* ============================ UpdateApp ============================= */
 class UpdateApp {
   DisplayManager* dm;
-  enum OtaState { OTA_IDLE, OTA_CONNECTING, OTA_CHECKING, OTA_DOWNLOADING, OTA_FAIL, OTA_UP_TO_DATE };
+  enum OtaState {
+    OTA_IDLE, OTA_CONNECTING, OTA_CHECKING,
+    OTA_DOWNLOADING, OTA_FAIL, OTA_UP_TO_DATE
+  };
   OtaState state = OTA_IDLE;
   unsigned long statusTimer = 0;
   String errorMsg = "";
 
 public:
   void begin(DisplayManager* d) { dm = d; }
+
   void onEnter() {
-    state = OTA_CONNECTING;
+    state       = OTA_CONNECTING;
     statusTimer = millis();
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -1009,9 +1205,9 @@ public:
         o.clearDisplay();
         dm->centerText("OTA UPDATE", 5, 1);
         dm->centerText("Connecting Wi-Fi", 25, 1);
-        o.fillRect(14, 45, 100, 4, SSD1306_BLACK);
-        o.setCursor(60, 42);
-        o.print((now / 500) % 2 == 0 ? "..." : " ");
+        o.setCursor(55, 42);
+        o.setTextSize(1);
+        o.print((now / 500) % 2 == 0 ? "..." : "   ");
         o.display();
         if (WiFi.status() == WL_CONNECTED) {
           state = OTA_CHECKING;
@@ -1019,6 +1215,7 @@ public:
           fail("Wi-Fi Timeout");
         }
         break;
+
       case OTA_CHECKING:
         o.clearDisplay();
         dm->centerText("OTA UPDATE", 5, 1);
@@ -1026,8 +1223,10 @@ public:
         o.display();
         runCheck();
         break;
+
       case OTA_DOWNLOADING:
         break;
+
       case OTA_FAIL:
         o.clearDisplay();
         dm->centerText("UPDATE FAILED", 5, 1);
@@ -1035,6 +1234,7 @@ public:
         dm->centerText("Dbl Tap to Exit", 50, 1);
         o.display();
         break;
+
       case OTA_UP_TO_DATE:
         o.clearDisplay();
         dm->centerText("SYSTEM OK", 10, 1);
@@ -1042,13 +1242,15 @@ public:
         dm->centerText("Dbl Tap to Exit", 50, 1);
         o.display();
         break;
+
+      default: break;
     }
   }
 
 private:
   void fail(String msg) {
     errorMsg = msg;
-    state = OTA_FAIL;
+    state    = OTA_FAIL;
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
   }
@@ -1058,8 +1260,8 @@ private:
     client.setInsecure();
     HTTPClient http;
     if (http.begin(client, VERSION_URL)) {
-      int httpCode = http.GET();
-      if (httpCode == HTTP_CODE_OK) {
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
         String payload = http.getString();
         payload.trim();
         int newVersion = payload.toInt();
@@ -1072,7 +1274,7 @@ private:
           WiFi.mode(WIFI_OFF);
         }
       } else {
-        fail("HTTP Err: " + String(httpCode));
+        fail("HTTP Err: " + String(code));
       }
       http.end();
     } else {
@@ -1086,25 +1288,29 @@ private:
     o.clearDisplay();
     dm->centerText("DOWNLOADING...", 25, 1);
     o.display();
+
     if (http.begin(client, BIN_URL)) {
-      int httpCode = http.GET();
-      if (httpCode == HTTP_CODE_OK) {
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
         int contentLength = http.getSize();
         if (Update.begin(contentLength)) {
           WiFiClient* stream = http.getStreamPtr();
           size_t written = 0;
           uint8_t buff[256];
           while (http.connected() && written < (size_t)contentLength) {
-            size_t size = stream->available();
-            if (size) {
-              int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+            size_t avail = stream->available();
+            if (avail) {
+              int c = stream->readBytes(buff, min(avail, sizeof(buff)));
               Update.write(buff, c);
               written += c;
               o.clearDisplay();
-              dm->centerText("FLASHING UPDATE", 5, 1);
-              int progressWidth = map(written, 0, contentLength, 0, 100);
+              dm->centerText("FLASHING...", 5, 1);
+              int pw = map(written, 0, contentLength, 0, 100);
               o.drawRect(14, 28, 100, 10, SSD1306_WHITE);
-              o.fillRect(14, 28, progressWidth, 10, SSD1306_WHITE);
+              o.fillRect(14, 28, pw, 10, SSD1306_WHITE);
+              char pct[8];
+              snprintf(pct, sizeof(pct), "%d%%", pw);
+              dm->centerText(pct, 44, 1);
               o.display();
             }
           }
@@ -1122,7 +1328,7 @@ private:
           fail("No Space");
         }
       } else {
-        fail("Bin HTTP Err: " + String(httpCode));
+        fail("Bin HTTP: " + String(code));
       }
       http.end();
     } else {
@@ -1144,6 +1350,7 @@ UpdateApp      updateApp;
 AppMode mode = MODE_MOCHI;
 unsigned long lastInteractionMs = 0;
 
+/* ------------------------------------------------------------------ */
 void enterMode(AppMode m) {
   mode = m;
   switch (mode) {
@@ -1154,12 +1361,15 @@ void enterMode(AppMode m) {
   }
 }
 
+/* ================================================================== */
 void setup() {
   Serial.begin(115200);
   randomSeed(esp_random());
+
   if (!displayMgr.begin()) {
     Serial.println("SH1106 init failed - check wiring/address (0x3C)");
   }
+
   touchMgr.begin();
   batteryMgr.begin();
   timeMgr.begin();
@@ -1176,33 +1386,39 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // Background services
   timeMgr.update();
   batteryMgr.update();
 
+  // Touch events
   TapEvent ev = touchMgr.update();
   if (ev != TAP_NONE) lastInteractionMs = now;
 
+  // Mode switching on double-tap
   if (ev == TAP_DOUBLE) {
-    enterMode(mode == MODE_MOCHI  ? MODE_WATCH :
+    enterMode(mode == MODE_MOCHI  ? MODE_WATCH  :
               mode == MODE_WATCH  ? MODE_FLAPPY :
               mode == MODE_FLAPPY ? MODE_UPDATE : MODE_MOCHI);
   } else if (ev == TAP_SINGLE) {
     switch (mode) {
-      case MODE_MOCHI:  mochiApp.onSingleTap(); break;
-      case MODE_WATCH:  break;
+      case MODE_MOCHI:  mochiApp.onSingleTap();  break;
+      case MODE_WATCH:  /* no action */           break;
       case MODE_FLAPPY: flappyApp.onSingleTap(); break;
-      case MODE_UPDATE: break;
+      case MODE_UPDATE: /* no action */           break;
     }
   }
 
+  // Keep idle timer alive during active game / OTA
   if (mode == MODE_FLAPPY && flappyApp.isPlaying()) lastInteractionMs = now;
-  if (mode == MODE_UPDATE) lastInteractionMs = now;
+  if (mode == MODE_UPDATE)                          lastInteractionMs = now;
 
+  // Idle timeout -> back to Mochi
   if (mode != MODE_MOCHI && (now - lastInteractionMs) >= IDLE_TIMEOUT) {
     lastInteractionMs = now;
     enterMode(MODE_MOCHI);
   }
 
+  // Run active app
   switch (mode) {
     case MODE_MOCHI:  mochiApp.update();  break;
     case MODE_WATCH:  watchApp.update();  break;
