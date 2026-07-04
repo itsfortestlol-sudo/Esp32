@@ -25,7 +25,7 @@ const int   DST_OFFSET_SEC = 0;
 const char* NTP_SERVER     = "asia.pool.ntp.org";
 
 const int   CURRENT_VERSION = 1;
-const char* VERSION_URL     = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/main.ino";
+const char* VERSION_URL     = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/virsion.txt";
 const char* BIN_URL         = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/firmware.bin";
 
 /* ------------------------------ Pins ------------------------------- */
