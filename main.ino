@@ -3,7 +3,6 @@
  * Board  : ESP32 DevKit V1 (ESP-WROOM-32)
  * Display: SH1106 128x64 I2C
  * Touch  : TTP223 (GPIO 4, active HIGH)
- * NO external JSON library needed - uses inline parser
  ***********************************************************************/
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -14,7 +13,10 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
+#include <ArduinoJson.h>
+#if __has_include("secrets.h")
 #include "secrets.h"
+#endif
 
 #define SSD1306_WHITE SH110X_WHITE
 #define SSD1306_BLACK SH110X_BLACK
@@ -52,89 +54,11 @@ const int SLEEP_HOUR_START = 22;
 const int SLEEP_HOUR_END   = 8;
 
 /* ========================= AI Timing =============================== */
-const unsigned long AI_POLL_INTERVAL = 60000;
+const unsigned long AI_POLL_INTERVAL = 60000; // 1 minute
 
 /* =========================== App Modes ============================= */
 enum AppMode  { MODE_MOCHI, MODE_WATCH, MODE_FLAPPY, MODE_UPDATE };
 enum TapEvent { TAP_NONE, TAP_SINGLE, TAP_DOUBLE };
-
-/* ====================== Tiny JSON Helpers =========================
- * No library needed. Extracts string/bool/int values from a flat
- * JSON string. Works perfectly for Gemini's simple response.
- * ================================================================ */
-namespace TinyJSON {
-
-  /* Find the value string for a given key in a JSON object string.
-   * Returns empty string if not found. */
-  String extractString(const String& json, const String& key) {
-    String search = "\"" + key + "\"";
-    int ki = json.indexOf(search);
-    if (ki < 0) return "";
-    int ci = json.indexOf(':', ki + search.length());
-    if (ci < 0) return "";
-    ci++;
-    while (ci < (int)json.length() && json[ci] == ' ') ci++;
-    if (json[ci] == '"') {
-      int start = ci + 1;
-      int end   = json.indexOf('"', start);
-      if (end < 0) return "";
-      return json.substring(start, end);
-    }
-    // Not a string — return raw token (for bool/number)
-    int end = ci;
-    while (end < (int)json.length() &&
-           json[end] != ',' && json[end] != '}' && json[end] != '\n')
-      end++;
-    String tok = json.substring(ci, end);
-    tok.trim();
-    return tok;
-  }
-
-  bool extractBool(const String& json, const String& key, bool def = false) {
-    String v = extractString(json, key);
-    if (v == "true")  return true;
-    if (v == "false") return false;
-    return def;
-  }
-
-  int extractInt(const String& json, const String& key, int def = 0) {
-    String v = extractString(json, key);
-    if (v.length() == 0) return def;
-    return v.toInt();
-  }
-
-  /* Find the inner JSON from Gemini's wrapper:
-   * candidates[0].content.parts[0].text  */
-  String extractGeminiText(const String& resp) {
-    // Look for "text": "<content>"
-    // The inner JSON may itself contain escaped quotes — handle carefully
-    String searchKey = "\"text\":";
-    int ki = resp.indexOf(searchKey);
-    if (ki < 0) return "";
-    int ci = ki + searchKey.length();
-    while (ci < (int)resp.length() && resp[ci] == ' ') ci++;
-    if (resp[ci] != '"') return "";
-    ci++; // skip opening quote
-    String result = "";
-    while (ci < (int)resp.length()) {
-      char c = resp[ci];
-      if (c == '\\' && ci + 1 < (int)resp.length()) {
-        char nc = resp[ci + 1];
-        if (nc == '"')       { result += '"';  ci += 2; continue; }
-        if (nc == '\\')      { result += '\\'; ci += 2; continue; }
-        if (nc == 'n')       { result += '\n'; ci += 2; continue; }
-        if (nc == 'r')       { result += '\r'; ci += 2; continue; }
-        if (nc == 't')       { result += '\t'; ci += 2; continue; }
-        result += c; ci++; continue;
-      }
-      if (c == '"') break; // closing quote
-      result += c;
-      ci++;
-    }
-    return result;
-  }
-
-} // namespace TinyJSON
 
 /* ======================== DisplayManager =========================== */
 class DisplayManager {
@@ -162,8 +86,8 @@ public:
 
 /* ========================= TouchManager ============================ */
 class TouchManager {
-  bool stableState         = false;
-  bool lastRead            = false;
+  bool stableState          = false;
+  bool lastRead             = false;
   unsigned long lastChangeMs    = 0;
   unsigned long firstTapMs      = 0;
   bool waitingSecondTap         = false;
@@ -184,7 +108,7 @@ public:
           waitingSecondTap = false;
           ev = TAP_DOUBLE;
         } else {
-          firstTapMs       = now;
+          firstTapMs = now;
           waitingSecondTap = true;
         }
       }
@@ -207,7 +131,9 @@ public:
     analogSetPinAttenuation(PIN_VBAT, ADC_11db);
     sample();
   }
-  void update() { if (millis() - lastReadMs >= 5000) sample(); }
+  void update() {
+    if (millis() - lastReadMs >= 5000) sample();
+  }
   void sample() {
     lastReadMs = millis();
     uint32_t mv = 0;
@@ -228,7 +154,7 @@ class TimeManager {
   unsigned long lastRetryMs  = 0;
   bool synced      = false;
 public:
-  void begin()     { startSync(); }
+  void begin() { startSync(); }
 
   void startSync() {
     WiFi.mode(WIFI_STA);
@@ -272,93 +198,122 @@ public:
 
   bool isSleepTime() {
     if (!synced) return false;
-    struct tm t; getLocal(t);
+    struct tm t;
+    getLocal(t);
     int h = t.tm_hour;
     return (h >= SLEEP_HOUR_START || h < SLEEP_HOUR_END);
   }
 
   int getHour() {
-    struct tm t; getLocal(t); return t.tm_hour;
+    struct tm t;
+    getLocal(t);
+    return t.tm_hour;
   }
+
   int getMinute() {
-    struct tm t; getLocal(t); return t.tm_min;
+    struct tm t;
+    getLocal(t);
+    return t.tm_min;
   }
 };
 
 /* ============================ MochiApp ============================== */
 class MochiApp {
   DisplayManager* dm = nullptr;
-  TimeManager*    tm = nullptr;
+  TimeManager* tm = nullptr;
 
-public:
+  /* ---- Mochi face expressions matching the photo:
+   * Two big rounded rectangle eyes, small dot/curve mouth
+   * Clean, minimal, cute - exactly like the robot mochi image
+   ---- */
+
   enum MochiExpression {
-    EXPR_NORMAL, EXPR_HAPPY, EXPR_SAD, EXPR_EXCITED,
-    EXPR_SLEEPY, EXPR_SLEEPING, EXPR_ANNOYED, EXPR_BORED,
-    EXPR_SHOCKED, EXPR_LOVE, EXPR_THINKING, EXPR_PLAYFUL, EXPR_ANGRY
+    EXPR_NORMAL,      // Default: big eyes, small dot mouth
+    EXPR_HAPPY,       // Eyes curved up (^  ^), wide smile
+    EXPR_SAD,         // Eyes droopy, downward mouth curve  
+    EXPR_EXCITED,     // Eyes wide + shining, open smile
+    EXPR_SLEEPY,      // Half closed eyes, small yawn
+    EXPR_SLEEPING,    // Closed arcs (- -), Zzz
+    EXPR_ANNOYED,     // Flat eyes, flat line mouth
+    EXPR_BORED,       // Half lid eyes, slight frown
+    EXPR_SHOCKED,     // O_O wide circle eyes, open mouth
+    EXPR_LOVE,        // Heart eyes, big smile
+    EXPR_THINKING,    // One eye normal one squint, look up
+    EXPR_PLAYFUL,     // Wink one eye, tongue out
+    EXPR_ANGRY        // Angry wake expression
   };
 
-private:
+  /* ---- AI driven action struct ---- */
   struct MochiAction {
     MochiExpression expression = EXPR_NORMAL;
-    bool showPhone     = false;
-    bool showCoffee    = false;
-    bool doLookAround  = false;
-    bool doBounce      = true;
-    unsigned long durationMs = 8000;
+    bool showPhone    = false;
+    bool showCoffee   = false;
+    bool doLookAround = false;
+    bool doBounce     = false;
+    unsigned long durationMs = 5000;
   };
 
   MochiAction currentAction;
+  MochiAction pendingAction;
+  bool hasPendingAction = false;
 
-  /* Touch reaction */
-  bool touchReacting      = false;
+  /* ---- Touch reaction (code-based, no AI) ---- */
+  bool touchReacting = false;
   unsigned long touchReactEndMs = 0;
-  MochiExpression touchExpr     = EXPR_HAPPY;
+  MochiExpression touchExpr = EXPR_HAPPY;
 
-  /* AI poll tracking */
+  /* ---- AI polling ---- */
   unsigned long lastAIPollMs  = 0;
   unsigned long actionStartMs = 0;
+  bool aiEnabled = false;
 
-  /* Animation */
+  /* ---- Animation state ---- */
   float bouncePhase  = 0.0f;
-  float lookPhase    = 0.0f;
-  float sparklePhase = 0.0f;
+  float lookPhase    = 0.0f;  // for look-around eye offset
+  bool  lookingRight = true;
 
-  /* Blink */
-  bool blinking      = false;
-  unsigned long blinkStartMs = 0;
-  unsigned long nextBlinkMs  = 0;
+  /* ---- Blink ---- */
+  bool blinking       = false;
+  unsigned long blinkStartMs  = 0;
+  unsigned long nextBlinkMs   = 0;
 
-  /* Zzz */
+  /* ---- Zzz particles ---- */
   struct ZzzParticle {
     float x, y, vy;
     int   size;
     bool  active;
-    float life; // 0..1
+    float alpha; // fade
   };
   static const int ZZZ_MAX = 4;
   ZzzParticle zzz[ZZZ_MAX];
   unsigned long nextZzzMs = 0;
 
-  /* Coffee */
+  /* ---- Coffee sip ---- */
   float coffeeSip  = 0.0f;
   bool  sipping    = false;
   unsigned long sipEndMs = 0;
 
-  /* Phone */
+  /* ---- Phone scroll ---- */
   int  phoneScrollY  = 0;
   unsigned long nextScrollMs = 0;
+
+  /* ---- Shine sparkle for excited/love ---- */
+  float sparklePhase = 0.0f;
 
   unsigned long lastFrameMs = 0;
 
 public:
   void begin(DisplayManager* d, TimeManager* t) {
-    dm = d; tm = t;
+    dm = d;
+    tm = t;
     initZzz();
     nextBlinkMs   = millis() + random(2000, 4000);
     actionStartMs = millis();
-    currentAction.expression = EXPR_NORMAL;
-    currentAction.doBounce   = true;
-    currentAction.durationMs = 8000;
+
+    // Start with normal expression
+    currentAction.expression  = EXPR_NORMAL;
+    currentAction.durationMs  = 8000;
+    currentAction.doBounce    = true;
   }
 
   void onEnter() {
@@ -369,27 +324,33 @@ public:
     actionStartMs = millis();
   }
 
-  /* Touch: always code-driven, instant, no AI call */
+  /* ---- Touch reaction: always code-based for responsiveness ---- */
   void onSingleTap() {
     unsigned long now = millis();
-    if (currentAction.expression == EXPR_SLEEPING || touchExpr == EXPR_SLEEPING) {
-      touchExpr       = EXPR_ANGRY;
-      touchReacting   = true;
+
+    if (currentAction.expression == EXPR_SLEEPING) {
+      // Woken up -> annoyed
+      touchExpr     = EXPR_ANGRY;
+      touchReacting = true;
       touchReactEndMs = now + 3000;
     } else {
+      // Random cute reactions to touch
       int r = random(0, 4);
-      touchExpr = (r == 0) ? EXPR_HAPPY  :
-                  (r == 1) ? EXPR_LOVE   :
-                  (r == 2) ? EXPR_PLAYFUL: EXPR_EXCITED;
+      if      (r == 0) touchExpr = EXPR_HAPPY;
+      else if (r == 1) touchExpr = EXPR_LOVE;
+      else if (r == 2) touchExpr = EXPR_PLAYFUL;
+      else             touchExpr = EXPR_EXCITED;
       touchReacting   = true;
       touchReactEndMs = now + 1500;
     }
   }
 
-  /* Called by AIManager with parsed action */
+  /* ---- Called by main loop when AI response arrives ---- */
   void applyAIAction(MochiExpression expr, bool phone, bool coffee,
                      bool lookAround, bool bounce, unsigned long durMs) {
+    // Don't interrupt sleep unless AI explicitly says wake
     if (tm->isSleepTime() && expr != EXPR_SLEEPING) return;
+
     currentAction.expression  = expr;
     currentAction.showPhone   = phone;
     currentAction.showCoffee  = coffee;
@@ -397,17 +358,584 @@ public:
     currentAction.doBounce    = bounce;
     currentAction.durationMs  = durMs;
     actionStartMs = millis();
-    coffeeSip = 0.0f; sipping = false; sipEndMs = millis() + 1500;
-    phoneScrollY = 0;  nextScrollMs = millis() + 600;
-    initZzz(); nextZzzMs = millis();
+
+    // Reset sub-animations
+    coffeeSip = 0.0f;
+    sipping   = false;
+    sipEndMs  = millis() + 1500;
+    phoneScrollY = 0;
+    nextScrollMs = millis() + 600;
+    initZzz();
+    nextZzzMs = millis();
   }
 
   bool shouldPollAI() {
+    // Don't poll during sleep
     if (tm->isSleepTime()) return false;
     return (millis() - lastAIPollMs >= AI_POLL_INTERVAL);
   }
-  void markAIPollDone() { lastAIPollMs = millis(); }
 
+  void markAIPollDone() {
+    lastAIPollMs = millis();
+  }
+
+  void update() {
+    unsigned long now = millis();
+    if (now - lastFrameMs < 33) return;
+    lastFrameMs = now;
+
+    /* ---- Sleep override ---- */
+    if (tm->isSleepTime()) {
+      if (currentAction.expression != EXPR_SLEEPING &&
+          !touchReacting) {
+        currentAction.expression  = EXPR_SLEEPING;
+        currentAction.showPhone   = false;
+        currentAction.showCoffee  = false;
+        currentAction.doBounce    = false;
+        currentAction.doLookAround= false;
+        actionStartMs = now;
+        initZzz();
+        nextZzzMs = now;
+      }
+    } else {
+      // Just woke up from sleep
+      if (currentAction.expression == EXPR_SLEEPING && !tm->isSleepTime()) {
+        currentAction.expression = EXPR_HAPPY;
+        currentAction.doBounce   = true;
+        currentAction.durationMs = 5000;
+        actionStartMs = now;
+      }
+    }
+
+    /* ---- Touch react expiry ---- */
+    if (touchReacting && now >= touchReactEndMs) {
+      touchReacting = false;
+      if (touchExpr == EXPR_ANGRY) {
+        // After anger from wake, go back to sleep
+        currentAction.expression = EXPR_SLEEPING;
+      }
+    }
+
+    /* ---- Blink logic ---- */
+    MochiExpression displayExpr = touchReacting ? touchExpr : currentAction.expression;
+    bool canBlink = (displayExpr != EXPR_SLEEPING &&
+                     displayExpr != EXPR_SHOCKED   &&
+                     displayExpr != EXPR_ANGRY      &&
+                     displayExpr != EXPR_LOVE);
+    if (canBlink) {
+      if (!blinking && now >= nextBlinkMs) {
+        blinking     = true;
+        blinkStartMs = now;
+      }
+      if (blinking && now - blinkStartMs > 150) {
+        blinking    = false;
+        nextBlinkMs = now + random(2500, 5000);
+      }
+    } else {
+      blinking = false;
+    }
+
+    /* ---- Bounce ---- */
+    if (currentAction.doBounce || touchReacting) {
+      bouncePhase += 0.04f;
+      if (bouncePhase > TWO_PI) bouncePhase -= TWO_PI;
+    }
+
+    /* ---- Look around ---- */
+    if (currentAction.doLookAround) {
+      lookPhase += 0.02f;
+      if (lookPhase > TWO_PI) lookPhase -= TWO_PI;
+    } else {
+      lookPhase = 0.0f;
+    }
+
+    /* ---- Sparkle ---- */
+    sparklePhase += 0.08f;
+    if (sparklePhase > TWO_PI) sparklePhase -= TWO_PI;
+
+    /* ---- Coffee sip ---- */
+    if (currentAction.showCoffee && !touchReacting) {
+      if (!sipping && now >= sipEndMs) {
+        sipping  = true;
+        sipEndMs = now + 700;
+      } else if (sipping && now >= sipEndMs) {
+        sipping  = false;
+        sipEndMs = now + random(1500, 3000);
+        coffeeSip = 0.0f;
+      }
+      if (sipping) {
+        float prog = 1.0f - (float)(sipEndMs - now) / 700.0f;
+        coffeeSip = sinf(prog * PI);
+      }
+    }
+
+    /* ---- Phone scroll ---- */
+    if (currentAction.showPhone && !touchReacting && now >= nextScrollMs) {
+      phoneScrollY = random(0, 8);
+      nextScrollMs = now + random(500, 1200);
+    }
+
+    /* ---- Zzz particles ---- */
+    if (displayExpr == EXPR_SLEEPING) {
+      updateZzz(now);
+    }
+
+    draw(now);
+  }
+
+private:
+  void initZzz() {
+    for (int i = 0; i < ZZZ_MAX; i++) {
+      zzz[i].active = false;
+      zzz[i].x     = 85.0f;
+      zzz[i].y     = 18.0f;
+      zzz[i].vy    = -0.35f;
+      zzz[i].size  = 1;
+      zzz[i].alpha = 1.0f;
+    }
+  }
+
+  void spawnZzz(unsigned long now) {
+    if (now < nextZzzMs) return;
+    nextZzzMs = now + 1100;
+    for (int i = 0; i < ZZZ_MAX; i++) {
+      if (!zzz[i].active) {
+        zzz[i].active = true;
+        zzz[i].x     = 84.0f + random(-2, 3);
+        zzz[i].y     = 20.0f;
+        zzz[i].vy    = -0.30f - (i % 3) * 0.04f;
+        zzz[i].size  = (i % 3 == 0) ? 2 : 1;
+        zzz[i].alpha = 1.0f;
+        break;
+      }
+    }
+  }
+
+  void updateZzz(unsigned long now) {
+    spawnZzz(now);
+    for (int i = 0; i < ZZZ_MAX; i++) {
+      if (!zzz[i].active) continue;
+      zzz[i].y += zzz[i].vy;
+      zzz[i].x += 0.12f;
+      zzz[i].alpha -= 0.008f;
+      if (zzz[i].y < 2 || zzz[i].x > 126 || zzz[i].alpha <= 0)
+        zzz[i].active = false;
+    }
+  }
+
+  void drawZzz(Adafruit_SH1106G& o) {
+    for (int i = 0; i < ZZZ_MAX; i++) {
+      if (!zzz[i].active) continue;
+      o.setTextSize(zzz[i].size);
+      o.setCursor((int)zzz[i].x, (int)zzz[i].y);
+      o.print("z");
+    }
+    o.setTextSize(1);
+  }
+
+  /* ---- Phone prop ---- */
+  void drawPhone(Adafruit_SH1106G& o, int px, int py) {
+    o.drawRoundRect(px, py, 14, 20, 2, SSD1306_WHITE);
+    o.fillRect(px + 2, py + 2, 10, 14, SSD1306_WHITE);
+    int lineY = py + 3 + (phoneScrollY % 4);
+    for (int l = 0; l < 3; l++) {
+      int ly = lineY + l * 4;
+      if (ly >= py + 2 && ly < py + 15)
+        o.drawFastHLine(px + 3, ly, 8, SSD1306_BLACK);
+    }
+    o.drawCircle(px + 7, py + 17, 1, SSD1306_WHITE);
+  }
+
+  /* ---- Coffee cup prop ---- */
+  void drawCoffeeCup(Adafruit_SH1106G& o, int cx, int cy, float sip) {
+    int tx = (int)(sip * 4.0f);
+    int ty = (int)(sip * 2.0f);
+    o.drawLine(cx,          cy + 4 - ty, cx + 1,   cy + 12, SSD1306_WHITE);
+    o.drawLine(cx + 11 - tx, cy + 4 - ty, cx + 9, cy + 12, SSD1306_WHITE);
+    o.drawFastHLine(cx + 1, cy + 12, 8, SSD1306_WHITE);
+    o.drawFastHLine(cx,     cy + 4 - ty, 11 - tx, SSD1306_WHITE);
+    o.drawLine(cx + 11 - tx, cy + 6 - ty, cx + 13 - tx, cy + 6 - ty, SSD1306_WHITE);
+    o.drawLine(cx + 13 - tx, cy + 6 - ty, cx + 13 - tx, cy + 10,    SSD1306_WHITE);
+    o.drawLine(cx + 13 - tx, cy + 10,     cx + 9,        cy + 10,    SSD1306_WHITE);
+    if (sip < 0.2f) {
+      o.drawPixel(cx + 3, cy + 2, SSD1306_WHITE);
+      o.drawPixel(cx + 6, cy + 1, SSD1306_WHITE);
+      o.drawPixel(cx + 9, cy + 2, SSD1306_WHITE);
+    }
+  }
+
+  /* ====================================================
+   * MAIN DRAW — Mochi face matching the photo style
+   * Two big rounded rect eyes, small dot/smile mouth
+   * Face centered around x=64
+   * ==================================================== */
+  void draw(unsigned long now) {
+    Adafruit_SH1106G& o = dm->oled;
+    o.clearDisplay();
+
+    MochiExpression expr = touchReacting ? touchExpr : currentAction.expression;
+
+    int bounce = 0;
+    if (currentAction.doBounce || touchReacting) {
+      bounce = (int)(1.5f * sinf(bouncePhase));
+    }
+
+    // Eye look-around offset
+    int lookX = (int)(4.0f * sinf(lookPhase));
+    int lookY = (int)(1.5f * cosf(lookPhase * 0.7f));
+
+    // Face layout - matching the photo:
+    // Eyes are two large rounded rectangles, side by side
+    // Centered on the 128x64 screen
+    int eyeW = 28;  // wide eyes like the photo
+    int eyeH = 26;  // tall eyes
+    int eyeGap = 8; // gap between eyes
+    int eyeY  = 10 + bounce;
+    int lEyeX = 64 - eyeGap/2 - eyeW; // left eye X
+    int rEyeX = 64 + eyeGap/2;         // right eye X
+
+    switch (expr) {
+
+      /* ---- NORMAL: Big rounded rect eyes, tiny curve mouth ---- */
+      case EXPR_NORMAL: {
+        int eH = eyeH;
+        int eY = eyeY;
+        if (blinking) {
+          float ph = (float)(now - blinkStartMs) / 150.0f;
+          float k  = 1.0f - sinf(ph * PI);
+          eH = max(3, (int)(eyeH * k));
+          eY = eyeY + (eyeH - eH) / 2;
+        }
+        o.fillRoundRect(lEyeX, eY, eyeW, eH, 7, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX, eY, eyeW, eH, 7, SSD1306_WHITE);
+        // Eye shine (small dark rect top-left of each eye)
+        if (!blinking) {
+          o.fillRect(lEyeX + 4, eY + 4, 5, 4, SSD1306_BLACK);
+          o.fillRect(rEyeX + 4, eY + 4, 5, 4, SSD1306_BLACK);
+        }
+        // Tiny dot mouth like the photo
+        drawCuteMouth(o, 64, 50 + bounce, MOUTH_SMILE_SMALL);
+        break;
+      }
+
+      /* ---- HAPPY: Eyes curved upward arcs, wide smile ---- */
+      case EXPR_HAPPY: {
+        // Draw filled eye arcs (like ^ ^ shape)
+        drawHappyEyes(o, lEyeX, rEyeX, eyeY, eyeW);
+        drawCuteMouth(o, 64, 50 + bounce, MOUTH_SMILE_BIG);
+        break;
+      }
+
+      /* ---- EXCITED: Wide eyes with star shine, big smile ---- */
+      case EXPR_EXCITED: {
+        int eH = eyeH + 4;
+        o.fillRoundRect(lEyeX - 1, eyeY, eyeW + 2, eH, 7, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX - 1, eyeY, eyeW + 2, eH, 7, SSD1306_WHITE);
+        // Star sparkles inside eyes
+        drawSparkle(o, lEyeX + eyeW/2, eyeY + eH/2, now);
+        drawSparkle(o, rEyeX + eyeW/2, eyeY + eH/2, now);
+        drawCuteMouth(o, 64, 51 + bounce, MOUTH_SMILE_BIG);
+        break;
+      }
+
+      /* ---- SAD: Droopy eyes, small downward curve ---- */
+      case EXPR_SAD: {
+        // Eyes: full rect then black top portion for droopy lid
+        o.fillRoundRect(lEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        // Black top third = droopy lid
+        o.fillRect(lEyeX, eyeY, eyeW, eyeH * 2/5, SSD1306_BLACK);
+        o.fillRect(rEyeX, eyeY, eyeW, eyeH * 2/5, SSD1306_BLACK);
+        // Lid line
+        o.drawFastHLine(lEyeX, eyeY + eyeH * 2/5, eyeW, SSD1306_WHITE);
+        o.drawFastHLine(rEyeX, eyeY + eyeH * 2/5, eyeW, SSD1306_WHITE);
+        // Tear drops
+        o.fillCircle(lEyeX + eyeW - 4, eyeY + eyeH + 3, 2, SSD1306_WHITE);
+        o.fillCircle(rEyeX + 4, eyeY + eyeH + 3, 2, SSD1306_WHITE);
+        drawCuteMouth(o, 64, 51 + bounce, MOUTH_SAD);
+        break;
+      }
+
+      /* ---- SLEEPY: Heavy half-lidded eyes, yawn ---- */
+      case EXPR_SLEEPY: {
+        o.fillRoundRect(lEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        // Cover top half with black for very heavy lids
+        o.fillRect(lEyeX, eyeY, eyeW, eyeH / 2 + 2, SSD1306_BLACK);
+        o.fillRect(rEyeX, eyeY, eyeW, eyeH / 2 + 2, SSD1306_BLACK);
+        o.drawFastHLine(lEyeX, eyeY + eyeH/2 + 2, eyeW, SSD1306_WHITE);
+        o.drawFastHLine(rEyeX, eyeY + eyeH/2 + 2, eyeW, SSD1306_WHITE);
+        // Yawn mouth (small oval)
+        o.drawEllipse(64, 51 + bounce, 5, 4, SSD1306_WHITE);
+        break;
+      }
+
+      /* ---- SLEEPING: Closed curved eyes, Zzz ---- */
+      case EXPR_SLEEPING: {
+        // Closed peaceful arcs
+        int midY = eyeY + eyeH / 2;
+        // Left eye closed arc
+        for (int t = 0; t < 3; t++) {
+          o.drawLine(lEyeX,            midY + 2,
+                     lEyeX + eyeW/2,  midY - 5 + t, SSD1306_WHITE);
+          o.drawLine(lEyeX + eyeW/2,  midY - 5 + t,
+                     lEyeX + eyeW,    midY + 2,     SSD1306_WHITE);
+        }
+        // Right eye closed arc
+        for (int t = 0; t < 3; t++) {
+          o.drawLine(rEyeX,            midY + 2,
+                     rEyeX + eyeW/2,  midY - 5 + t, SSD1306_WHITE);
+          o.drawLine(rEyeX + eyeW/2,  midY - 5 + t,
+                     rEyeX + eyeW,    midY + 2,     SSD1306_WHITE);
+        }
+        // Small serene smile
+        o.drawLine(57, 51, 61, 49, SSD1306_WHITE);
+        o.drawLine(61, 49, 67, 51, SSD1306_WHITE);
+        // Moon icon
+        o.drawCircle(7, 7, 5, SSD1306_WHITE);
+        o.fillCircle(10, 5, 4, SSD1306_BLACK);
+        // Stars
+        o.drawPixel(18, 3,  SSD1306_WHITE);
+        o.drawPixel(20, 8,  SSD1306_WHITE);
+        o.drawPixel(25, 2,  SSD1306_WHITE);
+        drawZzz(o);
+        break;
+      }
+
+      /* ---- ANNOYED/BORED: Flat heavy lids, thin line mouth ---- */
+      case EXPR_ANNOYED:
+      case EXPR_BORED: {
+        o.fillRoundRect(lEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRect(lEyeX, eyeY, eyeW, eyeH * 2/5, SSD1306_BLACK);
+        o.fillRect(rEyeX, eyeY, eyeW, eyeH * 2/5, SSD1306_BLACK);
+        o.drawFastHLine(lEyeX, eyeY + eyeH * 2/5, eyeW, SSD1306_WHITE);
+        o.drawFastHLine(rEyeX, eyeY + eyeH * 2/5, eyeW, SSD1306_WHITE);
+        // Flat line mouth
+        o.drawFastHLine(58, 51 + bounce, 16, SSD1306_WHITE);
+        o.drawFastHLine(58, 52 + bounce, 16, SSD1306_WHITE);
+        break;
+      }
+
+      /* ---- SHOCKED: Big round eyes, open O mouth ---- */
+      case EXPR_SHOCKED: {
+        o.fillCircle(lEyeX + eyeW/2, eyeY + eyeH/2, 13, SSD1306_WHITE);
+        o.fillCircle(rEyeX + eyeW/2, eyeY + eyeH/2, 13, SSD1306_WHITE);
+        o.fillCircle(lEyeX + eyeW/2, eyeY + eyeH/2, 6, SSD1306_BLACK);
+        o.fillCircle(rEyeX + eyeW/2, eyeY + eyeH/2, 6, SSD1306_BLACK);
+        // Small white pupil gleam
+        o.fillCircle(lEyeX + eyeW/2 - 3, eyeY + eyeH/2 - 3, 2, SSD1306_WHITE);
+        o.fillCircle(rEyeX + eyeW/2 - 3, eyeY + eyeH/2 - 3, 2, SSD1306_WHITE);
+        // O mouth
+        o.fillEllipse(64, 52 + bounce, 7, 5, SSD1306_WHITE);
+        o.fillEllipse(64, 52 + bounce, 4, 3, SSD1306_BLACK);
+        // Shock lines above
+        for (int i = -2; i <= 2; i++) {
+          o.drawFastVLine(64 + i * 8, 1, 6, SSD1306_WHITE);
+        }
+        break;
+      }
+
+      /* ---- LOVE: Heart-shaped eyes, big smile ---- */
+      case EXPR_LOVE: {
+        drawHeartEye(o, lEyeX + eyeW/2, eyeY + eyeH/2 + 1);
+        drawHeartEye(o, rEyeX + eyeW/2, eyeY + eyeH/2 + 1);
+        // Floating hearts
+        int hOff = (int)(3.0f * sinf(sparklePhase));
+        drawSmallHeart(o, lEyeX - 4, eyeY - 5 - hOff);
+        drawSmallHeart(o, rEyeX + eyeW + 1, eyeY - 5 - hOff);
+        drawCuteMouth(o, 64, 51 + bounce, MOUTH_SMILE_BIG);
+        break;
+      }
+
+      /* ---- THINKING: One normal, one squinted; look up ---- */
+      case EXPR_THINKING: {
+        // Left: normal eye
+        o.fillRoundRect(lEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRect(lEyeX + 4, eyeY + 4, 5, 4, SSD1306_BLACK);
+        // Right: squinted (tall eye, mostly covered)
+        o.fillRoundRect(rEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRect(rEyeX, eyeY, eyeW, eyeH * 3/5, SSD1306_BLACK);
+        o.drawFastHLine(rEyeX, eyeY + eyeH * 3/5, eyeW, SSD1306_WHITE);
+        // "..." thought bubble
+        o.drawPixel(92, 8,  SSD1306_WHITE);
+        o.drawPixel(96, 6,  SSD1306_WHITE);
+        o.drawPixel(100, 8, SSD1306_WHITE);
+        drawCuteMouth(o, 64, 51 + bounce, MOUTH_SMILE_SMALL);
+        break;
+      }
+
+      /* ---- PLAYFUL: Wink + tongue ---- */
+      case EXPR_PLAYFUL: {
+        // Left: open eye normal
+        int eH = eyeH;
+        int eY = eyeY;
+        if (blinking) {
+          float ph = (float)(now - blinkStartMs) / 150.0f;
+          float k  = 1.0f - sinf(ph * PI);
+          eH = max(3, (int)(eyeH * k));
+          eY = eyeY + (eyeH - eH) / 2;
+        }
+        o.fillRoundRect(lEyeX, eY, eyeW, eH, 7, SSD1306_WHITE);
+        o.fillRect(lEyeX + 4, eY + 4, 5, 4, SSD1306_BLACK);
+        // Right: wink (closed arc)
+        int wY = eyeY + eyeH / 2;
+        for (int t = 0; t < 3; t++) {
+          o.drawLine(rEyeX,           wY + 2,
+                     rEyeX + eyeW/2, wY - 4 + t, SSD1306_WHITE);
+          o.drawLine(rEyeX + eyeW/2, wY - 4 + t,
+                     rEyeX + eyeW,   wY + 2,     SSD1306_WHITE);
+        }
+        // Tongue out
+        o.fillRoundRect(59, 50 + bounce, 10, 7, 3, SSD1306_WHITE);
+        o.drawFastHLine(59, 53 + bounce, 10, SSD1306_BLACK);
+        o.drawFastHLine(60, 54 + bounce, 4, SSD1306_BLACK);
+        break;
+      }
+
+      /* ---- ANGRY: Angry woken face ---- */
+      case EXPR_ANGRY: {
+        // Eyes: shocked base
+        o.fillCircle(lEyeX + eyeW/2, eyeY + eyeH/2, 12, SSD1306_WHITE);
+        o.fillCircle(rEyeX + eyeW/2, eyeY + eyeH/2, 12, SSD1306_WHITE);
+        o.fillCircle(lEyeX + eyeW/2, eyeY + eyeH/2, 5, SSD1306_BLACK);
+        o.fillCircle(rEyeX + eyeW/2, eyeY + eyeH/2, 5, SSD1306_BLACK);
+        // Angry eyebrows (V shape)
+        o.drawLine(lEyeX,            eyeY - 4, lEyeX + eyeW, eyeY - 1, SSD1306_WHITE);
+        o.drawLine(rEyeX,            eyeY - 1, rEyeX + eyeW, eyeY - 4, SSD1306_WHITE);
+        // Thick angry brows
+        o.drawLine(lEyeX,            eyeY - 3, lEyeX + eyeW, eyeY,     SSD1306_WHITE);
+        o.drawLine(rEyeX,            eyeY,     rEyeX + eyeW, eyeY - 3, SSD1306_WHITE);
+        // Open screaming mouth
+        o.fillRoundRect(55, 49 + bounce, 18, 10, 3, SSD1306_WHITE);
+        o.fillRoundRect(58, 51 + bounce, 12, 6,  2, SSD1306_BLACK);
+        // "!" 
+        o.setTextSize(2);
+        o.setCursor(108, 2);
+        o.print("!");
+        o.setTextSize(1);
+        // Shake effect - horizontal lines to simulate vibration
+        for (int row = 4; row < 64; row += 8) {
+          o.drawPixel(random(0, 10), row, SSD1306_WHITE);
+          o.drawPixel(random(118, 128), row, SSD1306_WHITE);
+        }
+        break;
+      }
+
+      default:
+        // fallback to normal
+        o.fillRoundRect(lEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRoundRect(rEyeX, eyeY, eyeW, eyeH, 7, SSD1306_WHITE);
+        o.fillRect(lEyeX + 4, eyeY + 4, 5, 4, SSD1306_BLACK);
+        o.fillRect(rEyeX + 4, eyeY + 4, 5, 4, SSD1306_BLACK);
+        drawCuteMouth(o, 64, 50 + bounce, MOUTH_SMILE_SMALL);
+        break;
+    }
+
+    /* ---- Props (shown alongside AI-driven activities) ---- */
+    bool showingProps = !touchReacting;
+    if (showingProps && currentAction.showPhone &&
+        expr != EXPR_SLEEPING && expr != EXPR_ANGRY) {
+      drawPhone(o, 98, 20 + bounce);
+    }
+    if (showingProps && currentAction.showCoffee &&
+        expr != EXPR_SLEEPING && expr != EXPR_ANGRY) {
+      drawCoffeeCup(o, 100, 30 + bounce, coffeeSip);
+    }
+
+    o.display();
+  }
+
+  /* ---- Mouth helper enum & draw ---- */
+  enum MouthType { MOUTH_SMILE_SMALL, MOUTH_SMILE_BIG, MOUTH_SAD };
+
+  void drawCuteMouth(Adafruit_SH1106G& o, int cx, int cy, MouthType mt) {
+    switch (mt) {
+      case MOUTH_SMILE_SMALL:
+        // Tiny dot / small gentle curve - like the photo
+        o.fillCircle(cx,     cy,     2, SSD1306_WHITE);
+        o.fillCircle(cx - 5, cy + 1, 2, SSD1306_WHITE);
+        o.fillCircle(cx + 5, cy + 1, 2, SSD1306_WHITE);
+        o.fillRect(cx - 5, cy, 11, 2, SSD1306_WHITE);
+        break;
+      case MOUTH_SMILE_BIG:
+        // Wide W-curve smile
+        o.drawLine(55, cy,     59, cy + 4, SSD1306_WHITE);
+        o.drawLine(59, cy + 4, 64, cy + 1, SSD1306_WHITE);
+        o.drawLine(64, cy + 1, 69, cy + 4, SSD1306_WHITE);
+        o.drawLine(69, cy + 4, 73, cy,     SSD1306_WHITE);
+        // Thicken
+        o.drawLine(55, cy + 1, 59, cy + 5, SSD1306_WHITE);
+        o.drawLine(69, cy + 5, 73, cy + 1, SSD1306_WHITE);
+        break;
+      case MOUTH_SAD:
+        // Downward curve
+        o.drawLine(58, cy + 3, 62, cy,     SSD1306_WHITE);
+        o.drawLine(62, cy,     66, cy,     SSD1306_WHITE);
+        o.drawLine(66, cy,     70, cy + 3, SSD1306_WHITE);
+        o.drawLine(58, cy + 4, 62, cy + 1, SSD1306_WHITE);
+        o.drawLine(66, cy + 1, 70, cy + 4, SSD1306_WHITE);
+        break;
+    }
+  }
+
+  /* ---- Happy eyes (filled arcs) ---- */
+  void drawHappyEyes(Adafruit_SH1106G& o, int lx, int rx, int ey, int ew) {
+    int midY = ey + 16;
+    // Filled happy arc - left eye
+    for (int t = 0; t < 10; t++) {
+      o.drawLine(lx,         midY,
+                 lx + ew/2, midY - 12 + t, SSD1306_WHITE);
+      o.drawLine(lx + ew/2, midY - 12 + t,
+                 lx + ew,   midY,           SSD1306_WHITE);
+    }
+    // Filled happy arc - right eye
+    for (int t = 0; t < 10; t++) {
+      o.drawLine(rx,         midY,
+                 rx + ew/2, midY - 12 + t, SSD1306_WHITE);
+      o.drawLine(rx + ew/2, midY - 12 + t,
+                 rx + ew,   midY,           SSD1306_WHITE);
+    }
+  }
+
+  /* ---- Heart eye shape ---- */
+  void drawHeartEye(Adafruit_SH1106G& o, int cx, int cy) {
+    // Two bumps + triangle
+    o.fillCircle(cx - 5, cy - 4, 6, SSD1306_WHITE);
+    o.fillCircle(cx + 5, cy - 4, 6, SSD1306_WHITE);
+    o.fillTriangle(cx - 10, cy - 2, cx + 10, cy - 2, cx, cy + 8, SSD1306_WHITE);
+  }
+
+  void drawSmallHeart(Adafruit_SH1106G& o, int x, int y) {
+    o.fillCircle(x + 2, y,     3, SSD1306_WHITE);
+    o.fillCircle(x + 6, y,     3, SSD1306_WHITE);
+    o.fillTriangle(x, y + 1, x + 8, y + 1, x + 4, y + 6, SSD1306_WHITE);
+  }
+
+  /* ---- Sparkle / star for excited eyes ---- */
+  void drawSparkle(Adafruit_SH1106G& o, int cx, int cy, unsigned long now) {
+    float phase = sparklePhase;
+    int r1 = (int)(6.0f + 2.0f * sinf(phase));
+    int r2 = (int)(3.0f + 1.0f * cosf(phase));
+    // Cross sparkle
+    o.drawFastHLine(cx - r1, cy, r1 * 2 + 1, SSD1306_BLACK);
+    o.drawFastVLine(cx, cy - r1, r1 * 2 + 1, SSD1306_BLACK);
+    o.drawFastHLine(cx - r2, cy, r2 * 2 + 1, SSD1306_WHITE);
+    o.drawFastVLine(cx, cy - r2, r2 * 2 + 1, SSD1306_WHITE);
+  }
+
+  /* ---- Ellipse helper (GFX doesn't have filled ellipse) ---- */
+  void drawEllipse(Adafruit_SH1106G& o, int cx, int cy, int rx, int ry, uint16_t color) {
+    for (int y = -ry; y <= ry; y++) {
+      int xw = (int)(rx * sqrtf(1.0f - (float)(y*y)/(float)(ry*ry)));
+      o.drawFastHLine(cx - xw, cy + y, xw * 2, color);
+    }
+  }
+  void fillEllipse(Adafruit_SH1106G& o, int cx, int cy, int rx, int ry, uint16_t color) {
+    drawEllipse(o, cx, cy, rx, ry, color);
+  }
+
+public:
   MochiExpression expressionFromString(const String& s) {
     if (s == "happy")    return EXPR_HAPPY;
     if (s == "sad")      return EXPR_SAD;
@@ -423,472 +951,12 @@ public:
     if (s == "angry")    return EXPR_ANGRY;
     return EXPR_NORMAL;
   }
-
-  void update() {
-    unsigned long now = millis();
-    if (now - lastFrameMs < 33) return;
-    lastFrameMs = now;
-
-    /* Sleep override */
-    if (tm->isSleepTime()) {
-      if (currentAction.expression != EXPR_SLEEPING && !touchReacting) {
-        currentAction = MochiAction();
-        currentAction.expression = EXPR_SLEEPING;
-        currentAction.doBounce   = false;
-        actionStartMs = now;
-        initZzz(); nextZzzMs = now;
-      }
-    } else {
-      if (currentAction.expression == EXPR_SLEEPING && !touchReacting) {
-        currentAction.expression = EXPR_HAPPY;
-        currentAction.doBounce   = true;
-        currentAction.durationMs = 5000;
-        actionStartMs = now;
-      }
-    }
-
-    /* Touch expiry */
-    if (touchReacting && now >= touchReactEndMs) {
-      touchReacting = false;
-      if (touchExpr == EXPR_ANGRY)
-        currentAction.expression = EXPR_SLEEPING;
-    }
-
-    /* Blink */
-    MochiExpression displayExpr = touchReacting ? touchExpr : currentAction.expression;
-    bool canBlink = (displayExpr != EXPR_SLEEPING && displayExpr != EXPR_SHOCKED &&
-                     displayExpr != EXPR_ANGRY    && displayExpr != EXPR_LOVE);
-    if (canBlink) {
-      if (!blinking && now >= nextBlinkMs) { blinking = true; blinkStartMs = now; }
-      if (blinking && now - blinkStartMs > 150) {
-        blinking = false; nextBlinkMs = now + random(2500, 5000);
-      }
-    } else { blinking = false; }
-
-    /* Phases */
-    if (currentAction.doBounce || touchReacting) {
-      bouncePhase += 0.04f;
-      if (bouncePhase > TWO_PI) bouncePhase -= TWO_PI;
-    }
-    if (currentAction.doLookAround) {
-      lookPhase += 0.02f;
-      if (lookPhase > TWO_PI) lookPhase -= TWO_PI;
-    } else { lookPhase = 0.0f; }
-    sparklePhase += 0.08f;
-    if (sparklePhase > TWO_PI) sparklePhase -= TWO_PI;
-
-    /* Coffee sip */
-    if (currentAction.showCoffee && !touchReacting) {
-      if (!sipping && now >= sipEndMs) { sipping = true; sipEndMs = now + 700; }
-      else if (sipping && now >= sipEndMs) {
-        sipping = false; sipEndMs = now + random(1500, 3000); coffeeSip = 0.0f;
-      }
-      if (sipping) {
-        float prog = 1.0f - (float)(sipEndMs - now) / 700.0f;
-        coffeeSip = sinf(prog * PI);
-      }
-    }
-
-    /* Phone scroll */
-    if (currentAction.showPhone && !touchReacting && now >= nextScrollMs) {
-      phoneScrollY = random(0, 8); nextScrollMs = now + random(500, 1200);
-    }
-
-    /* Zzz */
-    if (displayExpr == EXPR_SLEEPING) updateZzz(now);
-
-    draw(now);
-  }
-
-private:
-  void initZzz() {
-    for (int i = 0; i < ZZZ_MAX; i++) {
-      zzz[i] = {85.0f, 20.0f, -0.35f, 1, false, 1.0f};
-    }
-  }
-
-  void spawnZzz(unsigned long now) {
-    if (now < nextZzzMs) return;
-    nextZzzMs = now + 1100;
-    for (int i = 0; i < ZZZ_MAX; i++) {
-      if (!zzz[i].active) {
-        zzz[i].active = true;
-        zzz[i].x     = 84.0f + random(-2, 3);
-        zzz[i].y     = 20.0f;
-        zzz[i].vy    = -0.30f - (i % 3) * 0.04f;
-        zzz[i].size  = (i % 3 == 0) ? 2 : 1;
-        zzz[i].life  = 1.0f;
-        break;
-      }
-    }
-  }
-
-  void updateZzz(unsigned long now) {
-    spawnZzz(now);
-    for (int i = 0; i < ZZZ_MAX; i++) {
-      if (!zzz[i].active) continue;
-      zzz[i].y    += zzz[i].vy;
-      zzz[i].x    += 0.12f;
-      zzz[i].life -= 0.008f;
-      if (zzz[i].y < 2 || zzz[i].x > 126 || zzz[i].life <= 0)
-        zzz[i].active = false;
-    }
-  }
-
-  void drawZzz(Adafruit_SH1106G& o) {
-    for (int i = 0; i < ZZZ_MAX; i++) {
-      if (!zzz[i].active) continue;
-      o.setTextSize(zzz[i].size);
-      o.setCursor((int)zzz[i].x, (int)zzz[i].y);
-      o.print("z");
-    }
-    o.setTextSize(1);
-  }
-
-  void drawPhone(Adafruit_SH1106G& o, int px, int py) {
-    o.drawRoundRect(px, py, 14, 20, 2, SSD1306_WHITE);
-    o.fillRect(px + 2, py + 2, 10, 14, SSD1306_WHITE);
-    int lineY = py + 3 + (phoneScrollY % 4);
-    for (int l = 0; l < 3; l++) {
-      int ly = lineY + l * 4;
-      if (ly >= py + 2 && ly < py + 15)
-        o.drawFastHLine(px + 3, ly, 8, SSD1306_BLACK);
-    }
-    o.drawCircle(px + 7, py + 17, 1, SSD1306_WHITE);
-  }
-
-  void drawCoffeeCup(Adafruit_SH1106G& o, int cx, int cy, float sip) {
-    int tx = (int)(sip * 4.0f), ty = (int)(sip * 2.0f);
-    o.drawLine(cx, cy + 4 - ty, cx + 1, cy + 12, SSD1306_WHITE);
-    o.drawLine(cx + 11 - tx, cy + 4 - ty, cx + 9, cy + 12, SSD1306_WHITE);
-    o.drawFastHLine(cx + 1, cy + 12, 8, SSD1306_WHITE);
-    o.drawFastHLine(cx, cy + 4 - ty, 11 - tx, SSD1306_WHITE);
-    o.drawLine(cx + 11 - tx, cy + 6 - ty, cx + 13 - tx, cy + 6 - ty, SSD1306_WHITE);
-    o.drawLine(cx + 13 - tx, cy + 6 - ty, cx + 13 - tx, cy + 10, SSD1306_WHITE);
-    o.drawLine(cx + 13 - tx, cy + 10, cx + 9, cy + 10, SSD1306_WHITE);
-    if (sip < 0.2f) {
-      o.drawPixel(cx + 3, cy + 2, SSD1306_WHITE);
-      o.drawPixel(cx + 6, cy + 1, SSD1306_WHITE);
-      o.drawPixel(cx + 9, cy + 2, SSD1306_WHITE);
-    }
-  }
-
-  /* Tiny ellipse fill helper */
-  void fillEllipseSimple(Adafruit_SH1106G& o, int cx, int cy,
-                          int rx, int ry, uint16_t color) {
-    for (int dy = -ry; dy <= ry; dy++) {
-      if (rx == 0) continue;
-      float ratio = 1.0f - (float)(dy * dy) / (float)(ry * ry);
-      if (ratio < 0) continue;
-      int xw = (int)(rx * sqrtf(ratio));
-      o.drawFastHLine(cx - xw, cy + dy, xw * 2 + 1, color);
-    }
-  }
-
-  enum MouthType { MOUTH_SMALL, MOUTH_BIG, MOUTH_SAD };
-
-  void drawMouth(Adafruit_SH1106G& o, int cx, int cy, MouthType mt) {
-    switch (mt) {
-      case MOUTH_SMALL:
-        // Cute W-dot mouth like the photo
-        o.fillRect(cx - 6, cy,     4, 3, SSD1306_WHITE);
-        o.fillRect(cx + 2, cy,     4, 3, SSD1306_WHITE);
-        o.fillRect(cx - 2, cy + 2, 4, 3, SSD1306_WHITE);
-        break;
-      case MOUTH_BIG:
-        o.drawLine(55, cy,     60, cy + 5, SSD1306_WHITE);
-        o.drawLine(60, cy + 5, 64, cy + 2, SSD1306_WHITE);
-        o.drawLine(64, cy + 2, 68, cy + 5, SSD1306_WHITE);
-        o.drawLine(68, cy + 5, 73, cy,     SSD1306_WHITE);
-        o.drawLine(55, cy + 1, 60, cy + 6, SSD1306_WHITE);
-        o.drawLine(68, cy + 6, 73, cy + 1, SSD1306_WHITE);
-        break;
-      case MOUTH_SAD:
-        o.drawLine(58, cy + 4, 62, cy + 1, SSD1306_WHITE);
-        o.drawLine(62, cy + 1, 66, cy + 1, SSD1306_WHITE);
-        o.drawLine(66, cy + 1, 70, cy + 4, SSD1306_WHITE);
-        o.drawLine(58, cy + 5, 62, cy + 2, SSD1306_WHITE);
-        o.drawLine(66, cy + 2, 70, cy + 5, SSD1306_WHITE);
-        break;
-    }
-  }
-
-  void drawHappyEyeFill(Adafruit_SH1106G& o, int lx, int rx, int ey, int ew) {
-    // Solid filled upward-arc eyes (happy ^ ^)
-    for (int row = 0; row < 14; row++) {
-      float t   = (float)row / 14.0f;
-      int   xOff = (int)(ew/2 * sinf(t * PI));
-      int   yPos = ey + 14 - row;
-      if (yPos >= 0 && yPos < 64) {
-        o.drawFastHLine(lx + ew/2 - xOff, yPos, xOff * 2 + 1, SSD1306_WHITE);
-        o.drawFastHLine(rx + ew/2 - xOff, yPos, xOff * 2 + 1, SSD1306_WHITE);
-      }
-    }
-  }
-
-  void drawHeartAt(Adafruit_SH1106G& o, int cx, int cy, int r) {
-    o.fillCircle(cx - r/2, cy - r/3, r, SSD1306_WHITE);
-    o.fillCircle(cx + r/2, cy - r/3, r, SSD1306_WHITE);
-    o.fillTriangle(cx - r, cy, cx + r, cy, cx, cy + r + 2, SSD1306_WHITE);
-  }
-
-  /* ===========================================================
-   * DRAW — two big rounded-rect eyes + expressive mouth
-   * Mochi face exactly like the photo
-   * =========================================================== */
-  void draw(unsigned long now) {
-    Adafruit_SH1106G& o = dm->oled;
-    o.clearDisplay();
-
-    MochiExpression expr = touchReacting ? touchExpr : currentAction.expression;
-    int bounce = (currentAction.doBounce || touchReacting)
-                 ? (int)(1.5f * sinf(bouncePhase)) : 0;
-
-    /* Eye geometry — same as the photo: two wide rounded rect eyes */
-    const int EYE_W   = 26;
-    const int EYE_H   = 24;
-    const int EYE_GAP = 8;
-    const int EYE_Y   = 10 + bounce;
-    const int L_EYE_X = 64 - EYE_GAP/2 - EYE_W; // = 30
-    const int R_EYE_X = 64 + EYE_GAP/2;           // = 68
-
-    switch (expr) {
-
-      /* ---- NORMAL ---- */
-      case EXPR_NORMAL: {
-        int h = EYE_H, y = EYE_Y;
-        if (blinking) {
-          float ph = (float)(now - blinkStartMs) / 150.0f;
-          float k  = 1.0f - sinf(ph * PI);
-          h = max(3, (int)(EYE_H * k));
-          y = EYE_Y + (EYE_H - h) / 2;
-        }
-        o.fillRoundRect(L_EYE_X, y, EYE_W, h, 6, SSD1306_WHITE);
-        o.fillRoundRect(R_EYE_X, y, EYE_W, h, 6, SSD1306_WHITE);
-        if (!blinking) {
-          // Gleam — small dark block top-left of each eye
-          o.fillRect(L_EYE_X + 4, y + 3, 5, 4, SSD1306_BLACK);
-          o.fillRect(R_EYE_X + 4, y + 3, 5, 4, SSD1306_BLACK);
-        }
-        drawMouth(o, 64, 50 + bounce, MOUTH_SMALL);
-        break;
-      }
-
-      /* ---- HAPPY ---- */
-      case EXPR_HAPPY: {
-        drawHappyEyeFill(o, L_EYE_X, R_EYE_X, EYE_Y, EYE_W);
-        drawMouth(o, 64, 50 + bounce, MOUTH_BIG);
-        break;
-      }
-
-      /* ---- EXCITED ---- */
-      case EXPR_EXCITED: {
-        o.fillRoundRect(L_EYE_X - 1, EYE_Y, EYE_W + 2, EYE_H + 3, 6, SSD1306_WHITE);
-        o.fillRoundRect(R_EYE_X - 1, EYE_Y, EYE_W + 2, EYE_H + 3, 6, SSD1306_WHITE);
-        // Star gleam inside eyes
-        int sx = L_EYE_X + EYE_W/2, sy = EYE_Y + EYE_H/2;
-        int sr = (int)(4.0f + 1.5f * sinf(sparklePhase));
-        o.drawFastHLine(sx - sr, sy, sr*2+1, SSD1306_BLACK);
-        o.drawFastVLine(sx, sy - sr, sr*2+1, SSD1306_BLACK);
-        o.drawFastHLine(sx - 2, sy, 5, SSD1306_WHITE);
-        o.drawFastVLine(sx, sy - 2, 5, SSD1306_WHITE);
-        sx = R_EYE_X + EYE_W/2;
-        o.drawFastHLine(sx - sr, sy, sr*2+1, SSD1306_BLACK);
-        o.drawFastVLine(sx, sy - sr, sr*2+1, SSD1306_BLACK);
-        o.drawFastHLine(sx - 2, sy, 5, SSD1306_WHITE);
-        o.drawFastVLine(sx, sy - 2, 5, SSD1306_WHITE);
-        drawMouth(o, 64, 51 + bounce, MOUTH_BIG);
-        break;
-      }
-
-      /* ---- SAD ---- */
-      case EXPR_SAD: {
-        o.fillRoundRect(L_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRoundRect(R_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        int lidH = EYE_H * 2 / 5;
-        o.fillRect(L_EYE_X, EYE_Y, EYE_W, lidH, SSD1306_BLACK);
-        o.fillRect(R_EYE_X, EYE_Y, EYE_W, lidH, SSD1306_BLACK);
-        o.drawFastHLine(L_EYE_X, EYE_Y + lidH, EYE_W, SSD1306_WHITE);
-        o.drawFastHLine(R_EYE_X, EYE_Y + lidH, EYE_W, SSD1306_WHITE);
-        // Tear drops
-        o.fillCircle(L_EYE_X + EYE_W - 4, EYE_Y + EYE_H + 3, 2, SSD1306_WHITE);
-        o.fillCircle(R_EYE_X + 3,          EYE_Y + EYE_H + 3, 2, SSD1306_WHITE);
-        drawMouth(o, 64, 51 + bounce, MOUTH_SAD);
-        break;
-      }
-
-      /* ---- SLEEPY ---- */
-      case EXPR_SLEEPY: {
-        o.fillRoundRect(L_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRoundRect(R_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        int lidH = EYE_H / 2 + 3;
-        o.fillRect(L_EYE_X, EYE_Y, EYE_W, lidH, SSD1306_BLACK);
-        o.fillRect(R_EYE_X, EYE_Y, EYE_W, lidH, SSD1306_BLACK);
-        o.drawFastHLine(L_EYE_X, EYE_Y + lidH, EYE_W, SSD1306_WHITE);
-        o.drawFastHLine(R_EYE_X, EYE_Y + lidH, EYE_W, SSD1306_WHITE);
-        // Yawn O
-        fillEllipseSimple(o, 64, 51 + bounce, 5, 4, SSD1306_WHITE);
-        fillEllipseSimple(o, 64, 51 + bounce, 3, 2, SSD1306_BLACK);
-        break;
-      }
-
-      /* ---- SLEEPING ---- */
-      case EXPR_SLEEPING: {
-        int midY = EYE_Y + EYE_H / 2;
-        // Closed arc eyes (peaceful)
-        for (int t = 0; t < 3; t++) {
-          o.drawLine(L_EYE_X,           midY + 2, L_EYE_X + EYE_W/2, midY - 5 + t, SSD1306_WHITE);
-          o.drawLine(L_EYE_X + EYE_W/2, midY - 5 + t, L_EYE_X + EYE_W, midY + 2,   SSD1306_WHITE);
-          o.drawLine(R_EYE_X,           midY + 2, R_EYE_X + EYE_W/2, midY - 5 + t, SSD1306_WHITE);
-          o.drawLine(R_EYE_X + EYE_W/2, midY - 5 + t, R_EYE_X + EYE_W, midY + 2,   SSD1306_WHITE);
-        }
-        // Serene smile
-        o.drawLine(57, 51, 61, 49, SSD1306_WHITE);
-        o.drawLine(61, 49, 67, 51, SSD1306_WHITE);
-        // Moon + stars
-        o.drawCircle(7, 7, 5, SSD1306_WHITE);
-        o.fillCircle(10, 5, 4, SSD1306_BLACK);
-        o.drawPixel(18, 3,  SSD1306_WHITE);
-        o.drawPixel(22, 8,  SSD1306_WHITE);
-        o.drawPixel(26, 2,  SSD1306_WHITE);
-        drawZzz(o);
-        break;
-      }
-
-      /* ---- ANNOYED / BORED ---- */
-      case EXPR_ANNOYED:
-      case EXPR_BORED: {
-        o.fillRoundRect(L_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRoundRect(R_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        int lidH = EYE_H * 2 / 5;
-        o.fillRect(L_EYE_X, EYE_Y, EYE_W, lidH, SSD1306_BLACK);
-        o.fillRect(R_EYE_X, EYE_Y, EYE_W, lidH, SSD1306_BLACK);
-        o.drawFastHLine(L_EYE_X, EYE_Y + lidH, EYE_W, SSD1306_WHITE);
-        o.drawFastHLine(R_EYE_X, EYE_Y + lidH, EYE_W, SSD1306_WHITE);
-        // Flat line mouth
-        o.fillRect(56, 51 + bounce, 16, 2, SSD1306_WHITE);
-        break;
-      }
-
-      /* ---- SHOCKED ---- */
-      case EXPR_SHOCKED: {
-        o.fillCircle(L_EYE_X + EYE_W/2, EYE_Y + EYE_H/2, 13, SSD1306_WHITE);
-        o.fillCircle(R_EYE_X + EYE_W/2, EYE_Y + EYE_H/2, 13, SSD1306_WHITE);
-        o.fillCircle(L_EYE_X + EYE_W/2, EYE_Y + EYE_H/2,  6, SSD1306_BLACK);
-        o.fillCircle(R_EYE_X + EYE_W/2, EYE_Y + EYE_H/2,  6, SSD1306_BLACK);
-        o.fillCircle(L_EYE_X + EYE_W/2 - 3, EYE_Y + EYE_H/2 - 3, 2, SSD1306_WHITE);
-        o.fillCircle(R_EYE_X + EYE_W/2 - 3, EYE_Y + EYE_H/2 - 3, 2, SSD1306_WHITE);
-        fillEllipseSimple(o, 64, 52 + bounce, 7, 5, SSD1306_WHITE);
-        fillEllipseSimple(o, 64, 52 + bounce, 4, 3, SSD1306_BLACK);
-        for (int i = -2; i <= 2; i++)
-          o.drawFastVLine(64 + i * 9, 1, 6, SSD1306_WHITE);
-        break;
-      }
-
-      /* ---- LOVE ---- */
-      case EXPR_LOVE: {
-        drawHeartAt(o, L_EYE_X + EYE_W/2, EYE_Y + EYE_H/2 + 1, 7);
-        drawHeartAt(o, R_EYE_X + EYE_W/2, EYE_Y + EYE_H/2 + 1, 7);
-        // Floating mini hearts
-        int hOff = (int)(3.0f * sinf(sparklePhase));
-        drawHeartAt(o, L_EYE_X - 2, EYE_Y - 6 - hOff, 3);
-        drawHeartAt(o, R_EYE_X + EYE_W + 2, EYE_Y - 6 - hOff, 3);
-        drawMouth(o, 64, 51 + bounce, MOUTH_BIG);
-        break;
-      }
-
-      /* ---- THINKING ---- */
-      case EXPR_THINKING: {
-        // Left: normal eye
-        o.fillRoundRect(L_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRect(L_EYE_X + 4, EYE_Y + 3, 5, 4, SSD1306_BLACK);
-        // Right: squinted
-        o.fillRoundRect(R_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRect(R_EYE_X, EYE_Y, EYE_W, EYE_H * 3/5, SSD1306_BLACK);
-        o.drawFastHLine(R_EYE_X, EYE_Y + EYE_H * 3/5, EYE_W, SSD1306_WHITE);
-        // Thought dots
-        o.fillCircle(96, 6,  2, SSD1306_WHITE);
-        o.fillCircle(101, 4, 2, SSD1306_WHITE);
-        o.fillCircle(106, 6, 2, SSD1306_WHITE);
-        drawMouth(o, 64, 51 + bounce, MOUTH_SMALL);
-        break;
-      }
-
-      /* ---- PLAYFUL (wink + tongue) ---- */
-      case EXPR_PLAYFUL: {
-        // Left eye: normal (with blink)
-        int h = EYE_H, y = EYE_Y;
-        if (blinking) {
-          float ph = (float)(now - blinkStartMs) / 150.0f;
-          float k  = 1.0f - sinf(ph * PI);
-          h = max(3, (int)(EYE_H * k));
-          y = EYE_Y + (EYE_H - h) / 2;
-        }
-        o.fillRoundRect(L_EYE_X, y, EYE_W, h, 6, SSD1306_WHITE);
-        o.fillRect(L_EYE_X + 4, y + 3, 5, 4, SSD1306_BLACK);
-        // Right eye: wink (closed arc)
-        int wY = EYE_Y + EYE_H / 2;
-        for (int t = 0; t < 3; t++) {
-          o.drawLine(R_EYE_X,           wY + 2, R_EYE_X + EYE_W/2, wY - 4 + t, SSD1306_WHITE);
-          o.drawLine(R_EYE_X + EYE_W/2, wY - 4 + t, R_EYE_X + EYE_W, wY + 2,   SSD1306_WHITE);
-        }
-        // Tongue
-        o.fillRoundRect(58, 50 + bounce, 12, 8, 3, SSD1306_WHITE);
-        o.drawFastHLine(58, 53 + bounce, 12, SSD1306_BLACK);
-        o.drawFastHLine(59, 54 + bounce,  5, SSD1306_BLACK);
-        break;
-      }
-
-      /* ---- ANGRY (woken from sleep) ---- */
-      case EXPR_ANGRY: {
-        int cx1 = L_EYE_X + EYE_W/2, cx2 = R_EYE_X + EYE_W/2;
-        int cy  = EYE_Y + EYE_H/2;
-        o.fillCircle(cx1, cy, 12, SSD1306_WHITE);
-        o.fillCircle(cx2, cy, 12, SSD1306_WHITE);
-        o.fillCircle(cx1, cy,  5, SSD1306_BLACK);
-        o.fillCircle(cx2, cy,  5, SSD1306_BLACK);
-        // Angry V-brows
-        o.drawLine(L_EYE_X,       EYE_Y - 4, L_EYE_X + EYE_W, EYE_Y - 1, SSD1306_WHITE);
-        o.drawLine(L_EYE_X,       EYE_Y - 3, L_EYE_X + EYE_W, EYE_Y,     SSD1306_WHITE);
-        o.drawLine(R_EYE_X,       EYE_Y - 1, R_EYE_X + EYE_W, EYE_Y - 4, SSD1306_WHITE);
-        o.drawLine(R_EYE_X,       EYE_Y,     R_EYE_X + EYE_W, EYE_Y - 3, SSD1306_WHITE);
-        // Screaming mouth
-        o.fillRoundRect(54, 49 + bounce, 20, 11, 3, SSD1306_WHITE);
-        o.fillRoundRect(57, 51 + bounce, 14,  7, 2, SSD1306_BLACK);
-        // "!"
-        o.setTextSize(2); o.setCursor(110, 1); o.print("!"); o.setTextSize(1);
-        break;
-      }
-
-      default: {
-        // Fallback = NORMAL
-        o.fillRoundRect(L_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRoundRect(R_EYE_X, EYE_Y, EYE_W, EYE_H, 6, SSD1306_WHITE);
-        o.fillRect(L_EYE_X + 4, EYE_Y + 3, 5, 4, SSD1306_BLACK);
-        o.fillRect(R_EYE_X + 4, EYE_Y + 3, 5, 4, SSD1306_BLACK);
-        drawMouth(o, 64, 50 + bounce, MOUTH_SMALL);
-        break;
-      }
-    }
-
-    /* Props */
-    if (!touchReacting && currentAction.showPhone &&
-        expr != EXPR_SLEEPING && expr != EXPR_ANGRY) {
-      drawPhone(o, 100, 22 + bounce);
-    }
-    if (!touchReacting && currentAction.showCoffee &&
-        expr != EXPR_SLEEPING && expr != EXPR_ANGRY) {
-      drawCoffeeCup(o, 101, 32 + bounce, coffeeSip);
-    }
-
-    o.display();
-  }
 };
 
 /* ============================ WatchApp ============================== */
 class WatchApp {
   DisplayManager* dm = nullptr;
-  TimeManager*    tm = nullptr;
+  TimeManager* tm = nullptr;
   BatteryManager* bm = nullptr;
   int lastSecond = -1;
 public:
@@ -939,34 +1007,44 @@ public:
 /* ============================ FlappyApp ============================= */
 class FlappyApp {
   DisplayManager* dm = nullptr;
-  Preferences     prefs;
+  Preferences prefs;
 public:
   enum GState { G_START, G_PLAYING, G_OVER };
   GState gstate = G_START;
 
 private:
-  float birdY = 30.0f, birdV = 0.0f;
+  float birdY   = 32.0f;
+  float birdV   = 0.0f;
   static constexpr int   BIRD_X = 22;
   static constexpr int   BIRD_R = 4;
+
+  /* Physics - easy and playable */
   static constexpr float GRAVITY    = 0.15f;
   static constexpr float FLAP_V     = -2.0f;
   static constexpr float PIPE_SPEED = 1.2f;
-  static constexpr int   NPIPES     = 2;
-  static constexpr int   PIPE_W     = 12;
-  static constexpr int   GAP_H      = 44;
-  static constexpr int   PIPE_SPACING = 82;
+
+  static constexpr int NPIPES       = 2;
+  static constexpr int PIPE_W       = 12;
+  static constexpr int GAP_H        = 44;    // Large gap - easy mode
+  static constexpr int PIPE_SPACING = 80;
 
   float pipeX[NPIPES];
   int   gapY[NPIPES];
   bool  passed[NPIPES];
 
-  int  score = 0, best = 0;
-  bool dirty = true;
-  unsigned long lastFrameMs  = 0;
-  unsigned long gameStartMs  = 0;
-  static constexpr unsigned long PIPE_DELAY_MS = 2200;
+  int  score    = 0;
+  int  best     = 0;
+  bool dirty    = true;
+  unsigned long lastFrameMs = 0;
 
   float wingPhase = 0.0f;
+
+  /* Bird starts above ground so you don't die immediately */
+  static constexpr float BIRD_START_Y = 30.0f;
+
+  /* Give player a moment before pipes arrive */
+  unsigned long gameStartMs = 0;
+  static constexpr unsigned long PIPE_DELAY_MS = 2000;
 
 public:
   void begin(DisplayManager* d) {
@@ -974,28 +1052,48 @@ public:
     prefs.begin("flappy", false);
     best = prefs.getInt("best", 0);
   }
-  void onEnter() { gstate = G_START; dirty = true; }
-  bool isPlaying()      const { return gstate == G_PLAYING; }
-  bool isOnStartScreen()const { return gstate == G_START;   }
 
-  void onSingleTap() {
-    if      (gstate == G_START)   startGame();
-    else if (gstate == G_PLAYING) { birdV = FLAP_V; wingPhase = 0.0f; }
-    else if (gstate == G_OVER)    startGame();
+  void onEnter() {
+    gstate = G_START;
+    dirty  = true;
   }
 
-  /* Returns true only from start screen — caller uses this to switch mode */
-  bool onDoubleTap() { return (gstate == G_START); }
+  bool isPlaying() const { return gstate == G_PLAYING; }
+  bool isOnStartScreen() const { return gstate == G_START; }
+
+  /* Single tap: start game or flap */
+  void onSingleTap() {
+    if (gstate == G_START) {
+      startGame();
+    } else if (gstate == G_PLAYING) {
+      birdV = FLAP_V;
+      wingPhase = 0.0f;
+    } else if (gstate == G_OVER) {
+      startGame();
+    }
+  }
+
+  /* Double tap: ONLY switch mode when on start screen
+   * Returns true if we should switch mode, false otherwise */
+  bool onDoubleTap() {
+    return (gstate == G_START);
+  }
 
   void startGame() {
-    birdY = 30.0f; birdV = 0.0f; score = 0; wingPhase = 0.0f;
+    birdY = BIRD_START_Y;
+    birdV = 0.0f;
+    score = 0;
+    wingPhase = 0.0f;
     gameStartMs = millis();
+
+    // Put pipes far off screen with delay
     for (int i = 0; i < NPIPES; i++) {
-      pipeX[i]  = 128.0f + 60.0f + i * PIPE_SPACING;
+      pipeX[i]  = 128.0f + 50.0f + i * PIPE_SPACING;
       gapY[i]   = random(10, 64 - 10 - GAP_H);
       passed[i] = false;
     }
-    gstate = G_PLAYING; dirty = false;
+    gstate = G_PLAYING;
+    dirty  = false;
   }
 
   void update() {
@@ -1003,46 +1101,62 @@ public:
     if (now - lastFrameMs < 33) return;
     lastFrameMs = now;
 
-    if (gstate == G_START) { if (dirty) { drawStart(); dirty = false; } return; }
-    if (gstate == G_OVER)  { if (dirty) { drawGameOver(); dirty = false; } return; }
+    if (gstate == G_START) {
+      if (dirty) { drawStart(); dirty = false; }
+      return;
+    }
+    if (gstate == G_OVER) {
+      if (dirty) { drawGameOver(); dirty = false; }
+      return;
+    }
 
+    /* Apply gravity */
     birdV += GRAVITY;
     birdY += birdV;
     wingPhase += 0.2f;
     if (wingPhase > TWO_PI) wingPhase -= TWO_PI;
 
+    /* Move pipes (only after delay) */
     bool pipesActive = (now - gameStartMs > PIPE_DELAY_MS);
     if (pipesActive) {
       for (int i = 0; i < NPIPES; i++) {
         pipeX[i] -= PIPE_SPEED;
         if (pipeX[i] + PIPE_W < 0) {
           float maxX = pipeX[0];
-          for (int j = 1; j < NPIPES; j++) if (pipeX[j] > maxX) maxX = pipeX[j];
+          for (int j = 1; j < NPIPES; j++)
+            if (pipeX[j] > maxX) maxX = pipeX[j];
           pipeX[i]  = maxX + PIPE_SPACING;
           gapY[i]   = random(10, 64 - 10 - GAP_H);
           passed[i] = false;
         }
         if (!passed[i] && pipeX[i] + PIPE_W < BIRD_X - BIRD_R) {
-          passed[i] = true; score++;
+          passed[i] = true;
+          score++;
         }
       }
     }
 
+    /* Collision with floor/ceiling */
     bool dead = (birdY - BIRD_R <= 1) || (birdY + BIRD_R >= 61);
+
+    /* Collision with pipes */
     if (pipesActive) {
       for (int i = 0; i < NPIPES && !dead; i++) {
-        bool inX  = (BIRD_X + BIRD_R > (int)pipeX[i]) &&
-                    (BIRD_X - BIRD_R < (int)(pipeX[i] + PIPE_W));
-        bool inGap = (birdY - BIRD_R >= gapY[i]) &&
-                     (birdY + BIRD_R <= gapY[i] + GAP_H);
+        bool inX  = ((BIRD_X + BIRD_R) > (int)pipeX[i]) &&
+                    ((BIRD_X - BIRD_R) < (int)(pipeX[i] + PIPE_W));
+        bool inGap = ((birdY - BIRD_R) >= gapY[i]) &&
+                     ((birdY + BIRD_R) <= gapY[i] + GAP_H);
         if (inX && !inGap) dead = true;
       }
     }
 
     if (dead) {
       if (score > best) { best = score; prefs.putInt("best", best); }
-      gstate = G_OVER; dirty = true; return;
+      gstate = G_OVER;
+      dirty  = true;
+      return;
     }
+
     drawGame(now);
   }
 
@@ -1053,8 +1167,8 @@ private:
       o.drawFastVLine(px + 3, 0, topH - 4, SSD1306_BLACK);
     }
     o.fillRect(px - 1, topH - 4, PIPE_W + 2, 4, SSD1306_WHITE);
-    o.fillRect(px - 1, botY, PIPE_W + 2, 4, SSD1306_WHITE);
     int bodyH = 63 - (botY + 4);
+    o.fillRect(px - 1, botY, PIPE_W + 2, 4, SSD1306_WHITE);
     if (bodyH > 0) {
       o.fillRect(px + 1, botY + 4, PIPE_W - 2, bodyH, SSD1306_WHITE);
       o.drawFastVLine(px + 3, botY + 4, bodyH, SSD1306_BLACK);
@@ -1069,6 +1183,7 @@ private:
                    bx + BIRD_R + 3, by,
                    bx + BIRD_R - 1, by + 2, SSD1306_WHITE);
     o.drawPixel(bx + 2, by - 2, SSD1306_BLACK);
+    o.drawLine(bx - BIRD_R, by + 1, bx - BIRD_R - 2, by - 1, SSD1306_WHITE);
   }
 
   void drawStart() {
@@ -1078,38 +1193,57 @@ private:
     o.setTextColor(SSD1306_BLACK);
     dm->centerText("FLAPPY MOCHI", 8, 1);
     o.setTextColor(SSD1306_WHITE);
-    o.fillRect(0, 0, 5, 18, SSD1306_WHITE);
-    o.fillRect(123, 0, 5, 18, SSD1306_WHITE);
-    o.fillRect(0, 48, 5, 16, SSD1306_WHITE);
-    o.fillRect(123, 48, 5, 16, SSD1306_WHITE);
+    // Decorative corner pipes
+    o.fillRect(0,   0,  5, 18, SSD1306_WHITE);
+    o.fillRect(123, 0,  5, 18, SSD1306_WHITE);
+    o.fillRect(0,   50, 5, 14, SSD1306_WHITE);
+    o.fillRect(123, 50, 5, 14, SSD1306_WHITE);
+    // Bird preview - animated bounce
     drawBird(o, 64, 36);
+    // Ground
     o.drawFastHLine(0, 62, 128, SSD1306_WHITE);
     o.drawFastHLine(0, 63, 128, SSD1306_WHITE);
-    dm->centerText("Tap  - Start", 44, 1);
-    dm->centerText("2xTap- Switch", 53, 1);
+    dm->centerText("Tap - Start", 45, 1);
+    dm->centerText("2xTap - Switch", 54, 1);
     o.display();
   }
 
   void drawGame(unsigned long now) {
     Adafruit_SH1106G& o = dm->oled;
     o.clearDisplay();
+
     bool pipesActive = (now - gameStartMs > PIPE_DELAY_MS);
+
     if (pipesActive) {
       for (int i = 0; i < NPIPES; i++) {
-        int px = (int)pipeX[i];
+        int px   = (int)pipeX[i];
+        int topH = gapY[i];
+        int botY = gapY[i] + GAP_H;
         if (px < 128 && px + PIPE_W > 0)
-          drawPipe(o, px, gapY[i], gapY[i] + GAP_H);
+          drawPipe(o, px, topH, botY);
       }
     }
+
+    // Ground
     o.drawFastHLine(0, 62, 128, SSD1306_WHITE);
     o.drawFastHLine(0, 63, 128, SSD1306_WHITE);
+    // Ground texture
     for (int x = 0; x < 128; x += 6) o.drawPixel(x, 61, SSD1306_WHITE);
+
     drawBird(o, BIRD_X, (int)birdY);
-    char buf[8]; snprintf(buf, sizeof(buf), "%d", score);
+
+    // Score box
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", score);
     int sw = (int)(strlen(buf) * 6 + 8);
     o.drawRoundRect((128 - sw) / 2, 1, sw, 10, 2, SSD1306_WHITE);
     dm->centerText(buf, 3, 1);
-    if (!pipesActive) dm->centerText("Get Ready!", 26, 1);
+
+    // "Get Ready!" hint during pipe delay
+    if (!pipesActive) {
+      dm->centerText("Get Ready!", 25, 1);
+    }
+
     o.display();
   }
 
@@ -1157,19 +1291,25 @@ public:
   void update() {
     Adafruit_SH1106G& o = dm->oled;
     unsigned long now   = millis();
+
     switch (state) {
       case OTA_CONNECTING:
         o.clearDisplay();
         dm->centerText("OTA UPDATE", 5, 1);
         dm->centerText("Connecting Wi-Fi", 22, 1);
         o.drawRect(14, 38, 100, 6, SSD1306_WHITE);
-        { int dots = (now / 400) % 4;
+        {
+          int dots = (now / 400) % 4;
           char dBuf[5] = "    ";
           for (int i = 0; i < dots; i++) dBuf[i] = '.';
-          dm->centerText(dBuf, 50, 1); }
+          dm->centerText(dBuf, 50, 1);
+        }
         o.display();
-        if (WiFi.status() == WL_CONNECTED) state = OTA_CHECKING;
-        else if (now - statusTimer > 20000) fail("Wi-Fi Timeout");
+        if (WiFi.status() == WL_CONNECTED) {
+          state = OTA_CHECKING;
+        } else if (now - statusTimer > 20000) {
+          fail("Wi-Fi Timeout");
+        }
         break;
 
       case OTA_CHECKING:
@@ -1180,7 +1320,8 @@ public:
         runCheck();
         break;
 
-      case OTA_DOWNLOADING: break;
+      case OTA_DOWNLOADING:
+        break;
 
       case OTA_FAIL:
         o.clearDisplay();
@@ -1206,184 +1347,288 @@ public:
 
 private:
   void fail(String msg) {
-    errorMsg = msg; state = OTA_FAIL;
-    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    errorMsg = msg;
+    state    = OTA_FAIL;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
   }
 
   void runCheck() {
-    WiFiClientSecure client; client.setInsecure();
+    WiFiClientSecure client;
+    client.setInsecure();
     HTTPClient http;
     if (http.begin(client, VERSION_URL)) {
-      int code = http.GET();
-      if (code == HTTP_CODE_OK) {
-        String payload = http.getString(); payload.trim();
-        if (payload.toInt() > CURRENT_VERSION) {
-          state = OTA_DOWNLOADING; executeUpdate(client);
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        payload.trim();
+        int newVersion = payload.toInt();
+        if (newVersion > CURRENT_VERSION) {
+          state = OTA_DOWNLOADING;
+          executeUpdate(client);
         } else {
           state = OTA_UP_TO_DATE;
-          WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_OFF);
         }
-      } else { fail("HTTP Err: " + String(code)); }
+      } else {
+        fail("HTTP Err: " + String(httpCode));
+      }
       http.end();
-    } else { fail("Connection Fail"); }
+    } else {
+      fail("Connection Fail");
+    }
   }
 
   void executeUpdate(WiFiClientSecure& client) {
     HTTPClient http;
     Adafruit_SH1106G& o = dm->oled;
-    o.clearDisplay(); dm->centerText("DOWNLOADING...", 25, 1); o.display();
+    o.clearDisplay();
+    dm->centerText("DOWNLOADING...", 25, 1);
+    o.display();
+
     if (http.begin(client, BIN_URL)) {
-      int code = http.GET();
-      if (code == HTTP_CODE_OK) {
-        int len = http.getSize();
-        if (Update.begin(len)) {
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        int contentLength = http.getSize();
+        if (Update.begin(contentLength)) {
           WiFiClient* stream = http.getStreamPtr();
-          size_t written = 0; uint8_t buf[256];
-          while (http.connected() && written < (size_t)len) {
-            size_t av = stream->available();
-            if (av) {
-              int c = stream->readBytes(buf, min(av, sizeof(buf)));
-              Update.write(buf, c); written += c;
-              o.clearDisplay(); dm->centerText("FLASHING UPDATE", 5, 1);
+          size_t written = 0;
+          uint8_t buff[256];
+          while (http.connected() && written < (size_t)contentLength) {
+            size_t available = stream->available();
+            if (available) {
+              int c = stream->readBytes(buff,
+                        (available > sizeof(buff)) ? sizeof(buff) : available);
+              Update.write(buff, c);
+              written += c;
+              o.clearDisplay();
+              dm->centerText("FLASHING UPDATE", 5, 1);
               o.drawRect(14, 26, 100, 12, SSD1306_WHITE);
-              int pw = (int)map((long)written, 0L, (long)len, 0L, 96L);
+              int pw = (int)map((long)written, 0L, (long)contentLength, 0L, 96L);
               if (pw > 0) o.fillRect(16, 28, pw, 8, SSD1306_WHITE);
-              char pb[8]; snprintf(pb, sizeof(pb), "%d%%", (int)(written*100/len));
-              dm->centerText(pb, 44, 1); o.display();
+              char pBuf[8];
+              snprintf(pBuf, sizeof(pBuf), "%d%%",
+                       (int)((written * 100) / contentLength));
+              dm->centerText(pBuf, 44, 1);
+              o.display();
             }
           }
           if (Update.end() && Update.isFinished()) {
-            o.clearDisplay(); dm->centerText("SUCCESS!", 10, 1);
-            dm->centerText("Rebooting...", 35, 1); o.display();
-            delay(2000); ESP.restart();
-          } else { fail("Flash Error"); }
-        } else { fail("No Space"); }
-      } else { fail("Bin HTTP: " + String(code)); }
+            o.clearDisplay();
+            dm->centerText("SUCCESS!", 10, 1);
+            dm->centerText("Rebooting...", 35, 1);
+            o.display();
+            delay(2000);
+            ESP.restart();
+          } else {
+            fail("Flash Error");
+          }
+        } else {
+          fail("No Space");
+        }
+      } else {
+        fail("Bin HTTP Err: " + String(httpCode));
+      }
       http.end();
-    } else { fail("Bin Link Fail"); }
+    } else {
+      fail("Bin Link Fail");
+    }
   }
 };
 
-/* ========================== AI Manager ============================
- * Polls Gemini 1.5 Flash every 60 s (skip during sleep window).
- * Uses response_mime_type=application/json to get clean JSON.
- * Parses with TinyJSON — zero external library dependency.
- * ================================================================ */
+/* ========================== AI Manager ============================== */
+/*
+ * Polls Gemini every 60 seconds.
+ * Sends current time + context, gets JSON action back.
+ * Uses WiFi only during the API call then disconnects.
+ */
 class AIManager {
-  enum AIState { AI_IDLE, AI_WORKING };
-  AIState       state        = AI_IDLE;
-  MochiApp*     mochiRef     = nullptr;
-  TimeManager*  timeRef      = nullptr;
+  enum AIState {
+    AI_IDLE,
+    AI_CONNECTING,
+    AI_REQUESTING,
+    AI_DONE
+  };
+
+  AIState       state         = AI_IDLE;
+  unsigned long stateStartMs  = 0;
+
+  MochiApp* mochiRef      = nullptr;
+  TimeManager* timeRef       = nullptr;
+
+  // Reuse WiFiClientSecure per request
+  WiFiClientSecure* secClient = nullptr;
+  HTTPClient* http      = nullptr;
+
+  String responseBuffer = "";
+  bool   waitingResp    = false;
 
 public:
-  void begin(MochiApp* m, TimeManager* t) { mochiRef = m; timeRef = t; }
+  void begin(MochiApp* m, TimeManager* t) {
+    mochiRef = m;
+    timeRef  = t;
+  }
 
+  /* Call every loop() tick */
   void update() {
-    if (state == AI_IDLE && mochiRef->shouldPollAI()) {
-      state = AI_WORKING;
-      doRequest();
-      state = AI_IDLE;
+    unsigned long now = millis();
+
+    switch (state) {
+
+      case AI_IDLE:
+        if (mochiRef->shouldPollAI()) {
+          // Start WiFi for API call
+          WiFi.mode(WIFI_STA);
+          WiFi.begin(WIFI_SSID, WIFI_PASS);
+          state        = AI_CONNECTING;
+          stateStartMs = now;
+          Serial.println("[AI] Connecting WiFi...");
+        }
+        break;
+
+      case AI_CONNECTING:
+        if (WiFi.status() == WL_CONNECTED) {
+          state        = AI_REQUESTING;
+          stateStartMs = now;
+          Serial.println("[AI] WiFi connected, sending request...");
+          sendGeminiRequest();
+        } else if (now - stateStartMs > 15000) {
+          // WiFi timeout - try next cycle
+          Serial.println("[AI] WiFi timeout");
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_OFF);
+          mochiRef->markAIPollDone(); // mark done so we wait another minute
+          state = AI_IDLE;
+        }
+        break;
+
+      case AI_REQUESTING:
+        // Already handled in sendGeminiRequest() (blocking)
+        // Just cleanup here
+        break;
+
+      case AI_DONE:
+        state = AI_IDLE;
+        break;
     }
   }
 
 private:
-  void doRequest() {
-    Serial.println("[AI] Starting request...");
-
-    // Connect WiFi
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    unsigned long wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 12000) {
-      delay(200);
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[AI] WiFi failed");
-      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-      mochiRef->markAIPollDone();
-      return;
-    }
-    Serial.println("[AI] WiFi OK");
-
-    // Build time context
+  /* Build prompt and call Gemini — blocking but quick (<5s) */
+  void sendGeminiRequest() {
+    // Get current time context
     struct tm t;
     timeRef->getLocal(t);
-    char timeBuf[16];
+    char timeBuf[32];
     strftime(timeBuf, sizeof(timeBuf), "%H:%M", &t);
 
-    // Build JSON request body manually — no library needed
-    // Using response_mime_type forces Gemini to output only JSON
-    String reqBody = "{\"contents\":[{\"parts\":[{\"text\":\"";
-    reqBody += "You are Mochi, an adorable small robot pet on an OLED screen. ";
-    reqBody += "Current time: ";
-    reqBody += timeBuf;
-    reqBody += ". Choose what to do for the next minute. ";
-    reqBody += "Reply with ONLY a JSON object with these keys: ";
-    reqBody += "expression (one of: normal happy sad excited sleepy sleeping annoyed bored shocked love thinking playful angry), ";
-    reqBody += "showPhone (boolean), showCoffee (boolean), doLookAround (boolean), ";
-    reqBody += "doBounce (boolean), durationSeconds (integer 5-55). ";
-    reqBody += "Be creative and natural!\"}]}],";
-    reqBody += "\"generationConfig\":{";
-    reqBody += "\"response_mime_type\":\"application/json\",";
-    reqBody += "\"temperature\":1.1,";
-    reqBody += "\"maxOutputTokens\":80}}";
+    // Build the JSON request body
+    String prompt = String(
+      "You are Mochi, an adorable robot pet living on a tiny OLED screen. "
+      "It is currently ") + timeBuf + " and you have total freedom to do whatever you want. "
+      "Respond ONLY with a JSON object (no markdown, no extra text) with these exact keys:\n"
+      "{\n"
+      "  \"expression\": \"<one of: normal, happy, sad, excited, sleepy, sleeping, annoyed, bored, shocked, love, thinking, playful, angry>\",\n"
+      "  \"showPhone\": <true or false>,\n"
+      "  \"showCoffee\": <true or false>,\n"
+      "  \"doLookAround\": <true or false>,\n"
+      "  \"doBounce\": <true or false>,\n"
+      "  \"durationSeconds\": <integer 3 to 55>\n"
+      "}\n"
+      "Pick whatever mood and activity feels natural for this time of day. Be creative and vary your behavior!";
 
+    // Build Gemini API request
+    StaticJsonDocument<1024> reqDoc;
+    JsonArray contents  = reqDoc.createNestedArray("contents");
+    JsonObject part0    = contents.createNestedObject();
+    JsonArray parts     = part0.createNestedArray("parts");
+    JsonObject textPart = parts.createNestedObject();
+    textPart["text"]    = prompt;
+
+    // Force JSON-only response with response_mime_type
+    JsonObject genConfig = reqDoc.createNestedObject("generationConfig");
+    genConfig["response_mime_type"] = "application/json";
+    genConfig["temperature"]        = 1.2;
+    genConfig["maxOutputTokens"]    = 120;
+
+    String reqBody;
+    serializeJson(reqDoc, reqBody);
+
+    // Send HTTPS request
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(12);
+    client.setInsecure(); // skip cert validation (fine for this use case)
+    client.setTimeout(10);
 
-    HTTPClient http;
+    HTTPClient httpClient;
     String url = String("https://") + GEMINI_HOST +
                  "/v1beta/models/gemini-1.5-flash:generateContent?key=" +
                  GEMINI_API_KEY;
 
-    if (!http.begin(client, url)) {
-      Serial.println("[AI] http.begin failed");
-      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-      mochiRef->markAIPollDone();
-      return;
+    bool ok = false;
+    if (httpClient.begin(client, url)) {
+      httpClient.addHeader("Content-Type", "application/json");
+      int code = httpClient.POST(reqBody);
+      Serial.printf("[AI] HTTP code: %d\n", code);
+
+      if (code == HTTP_CODE_OK) {
+        String resp = httpClient.getString();
+        Serial.println("[AI] Response: " + resp);
+        parseAndApply(resp);
+        ok = true;
+      } else {
+        Serial.println("[AI] Request failed: " + String(code));
+      }
+      httpClient.end();
     }
 
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(10000);
-    int code = http.POST(reqBody);
-    Serial.printf("[AI] HTTP %d\n", code);
-
-    if (code == HTTP_CODE_OK) {
-      String resp = http.getString();
-      Serial.println("[AI] Raw: " + resp.substring(0, 200));
-      parseAndApply(resp);
-    } else {
-      Serial.println("[AI] Error body: " + http.getString().substring(0, 100));
-    }
-
-    http.end();
+    // Disconnect WiFi immediately to save power & tokens
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+
     mochiRef->markAIPollDone();
-    Serial.println("[AI] Done.");
+    state = AI_IDLE;
   }
 
+  /* Parse Gemini response and apply action to Mochi */
   void parseAndApply(const String& rawResp) {
-    // Step 1: extract the text field from Gemini's response wrapper
-    String innerJson = TinyJSON::extractGeminiText(rawResp);
-    if (innerJson.length() == 0) {
-      Serial.println("[AI] Could not extract text field");
+    // Gemini wraps the JSON in candidates[0].content.parts[0].text
+    StaticJsonDocument<2048> outer;
+    DeserializationError err = deserializeJson(outer, rawResp);
+    if (err) {
+      Serial.println("[AI] Parse error (outer): " + String(err.c_str()));
       return;
     }
+
+    // Extract the text field from Gemini's response structure
+    String innerJson = "";
+    if (outer.containsKey("candidates")) {
+      innerJson = outer["candidates"][0]["content"]["parts"][0]["text"].as<String>();
+    } else {
+      Serial.println("[AI] No candidates in response");
+      return;
+    }
+
     innerJson.trim();
     Serial.println("[AI] Inner JSON: " + innerJson);
 
-    // Step 2: parse the action JSON
-    String exprStr   = TinyJSON::extractString(innerJson, "expression");
-    bool  showPhone  = TinyJSON::extractBool(innerJson, "showPhone",   false);
-    bool  showCoffee = TinyJSON::extractBool(innerJson, "showCoffee",  false);
-    bool  lookAround = TinyJSON::extractBool(innerJson, "doLookAround",false);
-    bool  doBounce   = TinyJSON::extractBool(innerJson, "doBounce",    true);
-    int   durSec     = TinyJSON::extractInt (innerJson, "durationSeconds", 30);
+    // Parse the actual action JSON
+    StaticJsonDocument<512> action;
+    err = deserializeJson(action, innerJson);
+    if (err) {
+      Serial.println("[AI] Parse error (inner): " + String(err.c_str()));
+      return;
+    }
 
-    if (exprStr.length() == 0) exprStr = "normal";
-    durSec = constrain(durSec, 5, 55);
+    // Extract values with safe defaults
+    String exprStr    = action["expression"]    | "normal";
+    bool  showPhone   = action["showPhone"]     | false;
+    bool  showCoffee  = action["showCoffee"]    | false;
+    bool  lookAround  = action["doLookAround"]  | false;
+    bool  doBounce    = action["doBounce"]      | true;
+    int   durSec      = action["durationSeconds"]| 30;
+
+    durSec = constrain(durSec, 3, 55);
 
     Serial.printf("[AI] expr=%s phone=%d coffee=%d look=%d bounce=%d dur=%ds\n",
                   exprStr.c_str(), showPhone, showCoffee, lookAround, doBounce, durSec);
@@ -1424,8 +1669,9 @@ void setup() {
   Serial.begin(115200);
   randomSeed(esp_random());
 
-  if (!displayMgr.begin())
-    Serial.println("SH1106 init failed - check wiring");
+  if (!displayMgr.begin()) {
+    Serial.println("SH1106 init failed");
+  }
 
   touchMgr.begin();
   batteryMgr.begin();
@@ -1453,25 +1699,27 @@ void loop() {
   /* ---- Touch routing ---- */
   if (ev == TAP_DOUBLE) {
     if (mode == MODE_FLAPPY) {
-      // Double tap only switches mode from start screen
+      // Only allow mode switch from Flappy start screen
       if (flappyApp.onDoubleTap()) {
         enterMode(MODE_UPDATE);
       }
-      // While playing: double tap is ignored
+      // else: ignore double tap while playing
     } else {
+      // Normal mode cycle: Mochi -> Watch -> Flappy -> Update -> Mochi
       enterMode(mode == MODE_MOCHI  ? MODE_WATCH  :
                 mode == MODE_WATCH  ? MODE_FLAPPY :
                 mode == MODE_FLAPPY ? MODE_UPDATE : MODE_MOCHI);
     }
   } else if (ev == TAP_SINGLE) {
     switch (mode) {
-      case MODE_MOCHI:  mochiApp.onSingleTap();  break;
-      case MODE_FLAPPY: flappyApp.onSingleTap(); break;
-      default: break;
+      case MODE_MOCHI:  mochiApp.onSingleTap();   break;
+      case MODE_FLAPPY: flappyApp.onSingleTap();  break;
+      case MODE_WATCH:  break;
+      case MODE_UPDATE: break;
     }
   }
 
-  /* Prevent idle timeout during active game or OTA */
+  /* ---- Idle timeout ---- */
   if (mode == MODE_FLAPPY && flappyApp.isPlaying()) lastInteractionMs = now;
   if (mode == MODE_UPDATE)                          lastInteractionMs = now;
 
@@ -1480,10 +1728,12 @@ void loop() {
     enterMode(MODE_MOCHI);
   }
 
-  /* AI polling — only on Mochi screen */
-  if (mode == MODE_MOCHI) aiMgr.update();
+  /* ---- AI polling (only when on Mochi screen) ---- */
+  if (mode == MODE_MOCHI) {
+    aiMgr.update();
+  }
 
-  /* Active mode tick */
+  /* ---- Active mode tick ---- */
   switch (mode) {
     case MODE_MOCHI:  mochiApp.update();  break;
     case MODE_WATCH:  watchApp.update();  break;
@@ -1491,3 +1741,4 @@ void loop() {
     case MODE_UPDATE: updateApp.update(); break;
   }
 }
+
