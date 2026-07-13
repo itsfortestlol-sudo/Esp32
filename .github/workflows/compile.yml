@@ -33,13 +33,17 @@ jobs:
 
     - name: Install Arduino CLI
       run: |
-        curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-        echo "$HOME/bin" >> $GITHUB_PATH
+        # Download directly to /usr/local/bin so it's always on PATH
+        curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz \
+          -o arduino-cli.tar.gz
+        tar -xzf arduino-cli.tar.gz
+        sudo mv arduino-cli /usr/local/bin/arduino-cli
+        sudo chmod +x /usr/local/bin/arduino-cli
         arduino-cli version
 
     - name: Configure Arduino CLI
       run: |
-        arduino-cli config init
+        arduino-cli config init --overwrite
         arduino-cli config set board_manager.additional_urls \
           https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
@@ -62,8 +66,7 @@ jobs:
 
     - name: Prepare Sketch
       run: |
-        # Arduino CLI requires the folder name = the .ino file name
-        # your file is main.ino so folder must be named main
+        # Arduino CLI requires folder name = .ino file name
         mkdir -p main
         cp main.ino main/main.ino
         echo "Sketch ready:"
@@ -100,7 +103,7 @@ jobs:
         echo "All files in build_output:"
         ls -la build_output/
 
-        # Pick the app binary (skip bootloader and partitions bin)
+        # Pick the app binary (skip bootloader and partitions)
         BIN_FILE=$(find build_output -name "*.bin" \
           | grep -v bootloader \
           | grep -v partitions \
@@ -120,12 +123,10 @@ jobs:
 
     - name: Update Version File
       run: |
-        # Pull CURRENT_VERSION number straight from main.ino
         VERSION=$(grep -o 'CURRENT_VERSION\s*=\s*[0-9]*' main/main.ino \
           | grep -o '[0-9]*' \
           | head -1)
 
-        # Fallback if grep finds nothing
         if [ -z "$VERSION" ]; then
           VERSION="2"
         fi
