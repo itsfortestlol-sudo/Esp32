@@ -3,7 +3,7 @@ name: Compile ESP32 Firmware
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch: 
 
 jobs:
   build:
@@ -31,25 +31,24 @@ jobs:
         arduino-cli lib install "Adafruit SH110X"
         arduino-cli lib install "ArduinoJson"
 
-    # 5. Compile the sketch
-    # Change 'mochipod' if your folder/file name is different
+    # 5. Compile the sketch directly from the root directory
     - name: Compile Sketch
       run: |
-        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir ./build ./mochipod
+        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir ./build .
 
-    # 6. Upload as GitHub Artifact (Best way to download it directly)
+    # 6. Upload as GitHub Artifact (Optional backup download)
     - name: Upload Binary Artifact
       uses: actions/upload-artifact@v4
       with:
         name: firmware-bin
-        path: ./build/mochipod.ino.bin
+        path: ./build/*.bin
 
-    # 7. Automatically commit and push firmware.bin back to the repository
+    # 7. Automatically commit and push firmware.bin back to the repository root
     - name: Commit and Push Firmware to Repo
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        cp ./build/mochipod.ino.bin ./firmware.bin
+        cp ./build/*.bin ./firmware.bin
         git add firmware.bin
         git commit -m "Automated build: Update firmware.bin [skip ci]" || echo "No changes to commit"
         git push
