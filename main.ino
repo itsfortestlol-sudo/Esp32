@@ -1,5 +1,5 @@
 /***********************************************************************
- * MochiPod - ESP32 Handheld (Mochi Gen2 / Watch / Flappy Bird / OTA UPDATE)
+ * MochiPod - ESP32 Handheld (Mochi Gen2 / Watch / Flappy Bird / OTA)
  * Board  : ESP32 DevKit V1 (ESP-WROOM-32)
  * Display: SH1106 128x64 I2C
  * Touch  : TTP223 (GPIO 4, active HIGH)
@@ -14,9 +14,7 @@
 #include <WiFiClientSecure.h>
 #include <Update.h>
 #include <ArduinoJson.h>
-#if __has_include("secrets.h")
 #include "secrets.h"
-#endif
 
 #define SSD1306_WHITE SH110X_WHITE
 #define SSD1306_BLACK SH110X_BLACK
@@ -26,7 +24,7 @@ const long  GMT_OFFSET_SEC  = 21600;
 const int   DST_OFFSET_SEC  = 0;
 const char* NTP_SERVER      = "asia.pool.ntp.org";
 
-const int   CURRENT_VERSION = 3;
+const int   CURRENT_VERSION = 2;
 const char* VERSION_URL     = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/virsion.txt";
 const char* BIN_URL         = "https://raw.githubusercontent.com/itsfortestlol-sudo/Esp32/main/firmware.bin";
 
@@ -220,11 +218,11 @@ public:
 /* ============================ MochiApp ============================== */
 class MochiApp {
   DisplayManager* dm = nullptr;
-  TimeManager* tm = nullptr;
+  TimeManager*    tm = nullptr;
 
   /* ---- Mochi face expressions matching the photo:
-   * Two big rounded rectangle eyes, small dot/curve mouth
-   * Clean, minimal, cute - exactly like the robot mochi image
+   *  Two big rounded rectangle eyes, small dot/curve mouth
+   *  Clean, minimal, cute - exactly like the robot mochi image
    ---- */
 
   enum MochiExpression {
@@ -956,7 +954,7 @@ public:
 /* ============================ WatchApp ============================== */
 class WatchApp {
   DisplayManager* dm = nullptr;
-  TimeManager* tm = nullptr;
+  TimeManager*    tm = nullptr;
   BatteryManager* bm = nullptr;
   int lastSecond = -1;
 public:
@@ -1454,12 +1452,12 @@ class AIManager {
   AIState       state         = AI_IDLE;
   unsigned long stateStartMs  = 0;
 
-  MochiApp* mochiRef      = nullptr;
-  TimeManager* timeRef       = nullptr;
+  MochiApp*     mochiRef      = nullptr;
+  TimeManager*  timeRef       = nullptr;
 
   // Reuse WiFiClientSecure per request
   WiFiClientSecure* secClient = nullptr;
-  HTTPClient* http      = nullptr;
+  HTTPClient*       http      = nullptr;
 
   String responseBuffer = "";
   bool   waitingResp    = false;
@@ -1741,4 +1739,3 @@ void loop() {
     case MODE_UPDATE: updateApp.update(); break;
   }
 }
-
