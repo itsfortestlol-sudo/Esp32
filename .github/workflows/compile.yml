@@ -57,14 +57,8 @@ jobs:
         # 4. Compile cleanly without messy build properties
         arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build
 
-
-
-    - name: Commit and Push Compiled Binary
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        # Explicitly copies the exact application binary file using the known output naming convention
-        cp build/main.ino.bin firmware.bin
-        git add firmware.bin
-        git commit -m "Automated firmware compilation" || exit 0
-        git push
+    - name: Upload Compiled Firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: esp32-firmware
+        path: ./build/main.ino.bin
