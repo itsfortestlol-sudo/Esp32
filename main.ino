@@ -1,5 +1,5 @@
 /***********************************************************************
- * MochiPod - ESP32 Handheld (Mochi Gen2 / Watch / Flappy Bird / OTA)
+ * MochiPod - ESP32 Handheld (Mochi Gen2 / Watch / Flappy Bird / OTA UPDATE)
  * Board  : ESP32 DevKit V1 (ESP-WROOM-32)
  * Display: SH1106 128x64 I2C
  * Touch  : TTP223 (GPIO 4, active HIGH)
