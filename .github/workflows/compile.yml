@@ -25,40 +25,20 @@ jobs:
       run: |
         arduino-cli lib install "Adafruit GFX Library"
         arduino-cli lib install "Adafruit SH110X"
-        arduino-cli lib install "ArduinoJson"
 
     - name: Compile Sketch
-      env:
-        WIFI_SSID: ${{ secrets.WIFI_SSID }}
-        WIFI_PASS: ${{ secrets.WIFI_PASS }}
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        GEMINI_HOST: ${{ secrets.GEMINI_HOST }}
       run: |
-        # 1. Create a matching folder directory for the sketch
+        # Creates a matching folder directory so the Arduino CLI can parse the sketch successfully
         mkdir -p main
         cp main.ino main/main.ino
-        
-        # 2. Dynamically generate a secrets.h file safely using EOF
-        cat << 'EOF' > main/secrets.h
-        #ifndef SECRETS_H
-        #define SECRETS_H
-        
-        #define WIFI_SSID "$WIFI_SSID"
-        #define WIFI_PASS "$WIFI_PASS"
-        #define GEMINI_HOST "$GEMINI_HOST"
-        #define GEMINI_API_KEY "$GEMINI_API_KEY"
-        
-        #endif
-        EOF
-        
-        # 3. Substitute the actual env variables into the file securely
-        envsubst < main/secrets.h > main/secrets_temp.h && mv main/secrets_temp.h main/secrets.h
-
-        # 4. Compile cleanly without messy build properties
         arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build
 
-    - name: Upload Compiled Firmware
-      uses: actions/upload-artifact@v4
-      with:
-        name: esp32-firmware
-        path: ./build/main.ino.bin
+    - name: Commit and Push Compiled Binary
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        # Explicitly copies the exact application binary file using the known output naming convention
+        cp build/main.ino.bin firmware.bin
+        git add firmware.bin
+        git commit -m "Automated firmware compilation" || exit 0
+        git push
