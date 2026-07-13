@@ -3,6 +3,8 @@ name: Build ESP32 Firmware
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - firmware.bin
 
 jobs:
   build:
@@ -17,10 +19,9 @@ jobs:
 
       - name: Install ESP32 platform
         run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          arduino-cli config init --overwrite
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
       - name: Install libraries
         run: |
@@ -34,11 +35,12 @@ jobs:
           arduino-cli compile \
             --fqbn esp32:esp32:esp32 \
             --output-dir build \
-            main/
+            ./main.ino
 
       - name: Rename firmware bin
         run: |
-          cp build/main.ino.bin firmware.bin
+          SKETCH_BIN="$(ls build/*.ino.bin | head -n 1)"
+          cp "$SKETCH_BIN" firmware.bin
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
@@ -51,5 +53,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add firmware.bin
-          git diff --staged --quiet || git commit -m "Auto-build firmware v$(date +'%Y%m%d-%H%M%S')"
+          git diff --staged --quiet || git commit -m "Auto-build firmware [skip ci]"
           git push
