@@ -38,9 +38,10 @@ jobs:
         mkdir -p main
         cp main.ino main/main.ino
         
-        # Compile while passing the variables as build flags
+        # Use single quotes around the build property and let bash safely expand the env variables
         arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build \
-          --build-property "compiler.cpp.extra_flags=-DWIFI_SSID=\"$WIFI_SSID\" -DWIFI_PASS=\"$WIFI_PASS\" -DGEMINI_HOST=\"$GEMINI_HOST\" -DGEMINI_API_KEY=\"$GEMINI_API_KEY\""
+          --build-property 'compiler.cpp.extra_flags=-DWIFI_SSID="'"$WIFI_SSID"'" -DWIFI_PASS="'"$WIFI_PASS"'" -DGEMINI_HOST="'"$GEMINI_HOST"'" -DGEMINI_API_KEY="'"$GEMINI_API_KEY"'"'
+
 
     - name: Commit and Push Compiled Binary
       run: |
