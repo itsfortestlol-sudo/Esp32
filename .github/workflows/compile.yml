@@ -28,11 +28,19 @@ jobs:
         arduino-cli lib install "ArduinoJson"
 
     - name: Compile Sketch
+      env:
+        WIFI_SSID: ${{ secrets.WIFI_SSID }}
+        WIFI_PASS: ${{ secrets.WIFI_PASS }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        GEMINI_HOST: ${{ secrets.GEMINI_HOST }}
       run: |
         # Creates a matching folder directory so the Arduino CLI can parse the sketch successfully
         mkdir -p main
         cp main.ino main/main.ino
-        arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build
+        
+        # Compile while passing the variables as build flags
+        arduino-cli compile --fqbn esp32:esp32:esp32 main --output-dir ./build \
+          --build-property "compiler.cpp.extra_flags=-DWIFI_SSID=\"$WIFI_SSID\" -DWIFI_PASS=\"$WIFI_PASS\" -DGEMINI_HOST=\"$GEMINI_HOST\" -DGEMINI_API_KEY=\"$GEMINI_API_KEY\""
 
     - name: Commit and Push Compiled Binary
       run: |
