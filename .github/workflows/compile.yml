@@ -31,14 +31,12 @@ jobs:
         arduino-cli lib install "Adafruit SH110X"
         arduino-cli lib install "ArduinoJson"
 
-    # 5. Compile main.ino directly and save the output to the root as firmware.bin
+    # 5. Compile main.ino directly using --sketch-path
     - name: Compile Sketch
       run: |
         mkdir -p build_output
-        arduino-cli compile --fqbn esp32:esp32:esp32 --build-path ./build_output ./main.ino
-        cp ./build_output/main.ino.bin ./firmware.bin
-
-    # 6. Push firmware.bin straight back to your main branch
+        arduino-cli compile --fqbn esp32:esp32:esp32 --build-path ./build_output --sketch-path .
+        cp ./build_output/main.ino.bin ./firmware.bin    # 6. Push firmware.bin straight back to your main branch
     - name: Commit and Push firmware.bin
       run: |
         git config --global user.name "github-actions[bot]"
