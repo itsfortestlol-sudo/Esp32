@@ -35,11 +35,11 @@
 
 /* ============================ CONFIG (single-file) ============================ */
 /* WiFi (put your real credentials here) */
-static const char* WIFI_SSID = "Mahir Afia";
-static const char* WIFI_PASS = "afiamahir2026";
+static const char* WIFI_SSID = "YOUR_WIFI_SSID";
+static const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
 /* Gemini (put your real key here) */
-static const char* GEMINI_API_KEY = "AQ.Ab8RN6KqxIMLahKONQULFEc00-0y1I8zCmqk7iXhwaJPKQYHLg";
+static const char* GEMINI_API_KEY = "YOUR_GEMINI_API_KEY";
 /* Model endpoint for Generative Language API */
 static const char* GEMINI_MODEL = "gemini-1.5-flash"; // change if you want
 static const long GMT_OFFSET_SEC = 21600;
