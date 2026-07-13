@@ -1,57 +1,57 @@
-name: Build ESP32 Firmware
+name: Compile ESP32 Firmware
 
 on:
   push:
-    branches: [ main ]
-    paths-ignore:
-      - firmware.bin
+    branches: [ main, master ]
+  workflow_dispatch: # Allows manual trigger from the Actions tab
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    # 1. Check out the repository
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Setup Arduino CLI
-        uses: arduino/setup-arduino-cli@v1
+    # 2. Set up Arduino CLI
+    - name: Setup Arduino CLI
+      uses: arduino/setup-arduino-cli@v2
 
-      - name: Install ESP32 platform
-        run: |
-          arduino-cli config init --overwrite
-          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+    # 3. Install ESP32 Platform Core
+    - name: Install ESP32 Platform
+      run: |
+        arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+        arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-      - name: Install libraries
-        run: |
-          arduino-cli lib install "Adafruit GFX Library"
-          arduino-cli lib install "Adafruit SH110X"
-          arduino-cli lib install "Adafruit BusIO"
-          arduino-cli lib install "ArduinoJson"
+    # 4. Install required libraries
+    - name: Install Libraries
+      run: |
+        arduino-cli lib install "Adafruit GFX Library"
+        arduino-cli lib install "Adafruit SH110X"
+        arduino-cli lib install "ArduinoJson"
 
-      - name: Build firmware
-        run: |
-          arduino-cli compile \
-            --fqbn esp32:esp32:esp32 \
-            --output-dir build \
-            ./main.ino
+    # 5. Compile the sketch
+    # Change 'mochipod' if your folder/file name is different
+    - name: Compile Sketch
+      run: |
+        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir ./build ./mochipod
 
-      - name: Rename firmware bin
-        run: |
-          SKETCH_BIN="$(ls build/*.ino.bin | head -n 1)"
-          cp "$SKETCH_BIN" firmware.bin
+    # 6. Upload as GitHub Artifact (Best way to download it directly)
+    - name: Upload Binary Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: firmware-bin
+        path: ./build/mochipod.ino.bin
 
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware
-          path: firmware.bin
-
-      - name: Commit firmware to repo
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add firmware.bin
-          git diff --staged --quiet || git commit -m "Auto-build firmware [skip ci]"
-          git push
+    # 7. Automatically commit and push firmware.bin back to the repository
+    - name: Commit and Push Firmware to Repo
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        cp ./build/mochipod.ino.bin ./firmware.bin
+        git add firmware.bin
+        git commit -m "Automated build: Update firmware.bin [skip ci]" || echo "No changes to commit"
+        git push
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
