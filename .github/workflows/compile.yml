@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Check out the repository
+    # 1. Grab everything from your main branch
     - name: Checkout Repository
       uses: actions/checkout@v4
 
@@ -31,38 +31,18 @@ jobs:
         arduino-cli lib install "Adafruit SH110X"
         arduino-cli lib install "ArduinoJson"
 
-    # 5. Move everything to a temporary "main" folder to satisfy arduino-cli structural requirements
-    - name: Prepare Workspace Structure
-      run: |
-        mkdir temp_workspace
-        # Move all repository contents into a subfolder named 'main'
-        mkdir temp_workspace/main
-        cp -r * temp_workspace/main/ 2>/dev/null || true
-        # Clean up the runner root so we can compile fresh from the temp workspace
-        rm -rf *
-        mv temp_workspace/* .
-        rm -rf temp_workspace
-
-    # 6. Compile the sketch from the 'main' directory
+    # 5. Compile main.ino directly and save the output to the root as firmware.bin
     - name: Compile Sketch
       run: |
-        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir ./build ./main
+        mkdir -p build_output
+        arduino-cli compile --fqbn esp32:esp32:esp32 --build-path ./build_output ./main.ino
+        cp ./build_output/main.ino.bin ./firmware.bin
 
-    # 7. Check back out the original repository so we can cleanly commit the file back to the root
-    - name: Reset Checkout for Push
-      uses: actions/checkout@v4
-      with:
-        clean: false # Do not overwrite the ./build folder we just generated
-
-    # 8. Move the compiled file to the root as firmware.bin and push it
-    - name: Commit and Push firmware.bin to Main Branch
+    # 6. Push firmware.bin straight back to your main branch
+    - name: Commit and Push firmware.bin
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        
-        # Copy the compiled binary out, naming it explicitly firmware.bin
-        cp ./build/main.ino.bin ./firmware.bin
-        
         git add firmware.bin
         git commit -m "Automated build: Update firmware.bin [skip ci]" || echo "No changes to commit"
         git push origin main
