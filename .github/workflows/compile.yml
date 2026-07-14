@@ -1,186 +1,66 @@
-# .github/workflows/compile.yml
-
-name: Build ESP32 Firmware
+name: Build and Deploy Firmware
 
 on:
   push:
     branches: [ main ]
-    paths-ignore:
-      - 'firmware.bin'
-      - 'virsion.txt'
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 0
+      # ── 1. Checkout ────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Cache Arduino CLI
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.arduino15
-          ~/Arduino/libraries
-        key: arduino-esp32-${{ hashFiles('main.ino') }}
-        restore-keys: |
-          arduino-esp32-
+      # ── 2. Generate real secrets.h from GitHub Secrets ─────────────
+      - name: Generate secrets.h
+        run: |
+          cat > secrets.h << 'EOF'
+          #ifndef SECRETS_H
+          #define SECRETS_H
+          static const char* WIFI_SSID      = "${{ secrets.WIFI_SSID }}";
+          static const char* WIFI_PASS      = "${{ secrets.WIFI_PASS }}";
+          static const char* GEMINI_API_KEY = "${{ secrets.GEMINI_API_KEY }}";
+          static const char* GEMINI_MODEL   = "${{ secrets.GEMINI_HOST }}";
+          #endif
+          EOF
 
-    - name: Install Arduino CLI
-      run: |
-        # Download directly to /usr/local/bin so it's always on PATH
-        curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz \
-          -o arduino-cli.tar.gz
-        tar -xzf arduino-cli.tar.gz
-        sudo mv arduino-cli /usr/local/bin/arduino-cli
-        sudo chmod +x /usr/local/bin/arduino-cli
-        arduino-cli version
+      # ── 3. Setup Arduino CLI ───────────────────────────────────────
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
 
-    - name: Configure Arduino CLI
-      run: |
-        arduino-cli config init --overwrite
-        arduino-cli config set board_manager.additional_urls \
-          https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+      # ── 4. Install ESP32 board ─────────────────────────────────────
+      - name: Install ESP32 board
+        run: |
+          arduino-cli core update-index \
+            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 \
+            --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-    - name: Update Board Index
-      run: |
-        arduino-cli core update-index
+      # ── 5. Install libraries ───────────────────────────────────────
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit SH110X"
+          arduino-cli lib install "ArduinoJson"
 
-    - name: Install ESP32 Board Package
-      run: |
-        arduino-cli core install esp32:esp32@2.0.14
-        arduino-cli core list
+      # ── 6. Compile ─────────────────────────────────────────────────
+      - name: Compile firmware
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32 \
+            --output-dir ./build \
+            main.ino
 
-    - name: Install Required Libraries
-      run: |
-        arduino-cli lib install "Adafruit GFX Library"
-        arduino-cli lib install "Adafruit SH110X"
-        arduino-cli lib install "ArduinoJson"
-        arduino-cli lib install "Adafruit BusIO"
-        arduino-cli lib list
-
-    - name: Prepare Sketch
-      run: |
-        # Arduino CLI requires folder name = .ino file name
-        mkdir -p main
-        cp main.ino main/main.ino
-        echo "Sketch ready:"
-        ls -la main/
-
-    - name: Compile Firmware
-      run: |
-        mkdir -p build_output
-
-        echo "Compiling main.ino for ESP32 DevKit V1..."
-
-        arduino-cli compile \
-          --fqbn esp32:esp32:esp32 \
-          --output-dir build_output \
-          --warnings default \
-          --verbose \
-          main 2>&1 | tee compile_log.txt
-
-        if [ ${PIPESTATUS[0]} -ne 0 ]; then
-          echo "=============================="
-          echo "COMPILATION FAILED"
-          echo "=============================="
-          cat compile_log.txt
-          exit 1
-        fi
-
-        echo "=============================="
-        echo "COMPILATION SUCCESSFUL"
-        echo "=============================="
-        ls -la build_output/
-
-    - name: Copy Binary to Root
-      run: |
-        echo "All files in build_output:"
-        ls -la build_output/
-
-        # Pick the app binary (skip bootloader and partitions)
-        BIN_FILE=$(find build_output -name "*.bin" \
-          | grep -v bootloader \
-          | grep -v partitions \
-          | head -1)
-
-        if [ -z "$BIN_FILE" ]; then
-          echo "ERROR: firmware .bin not found!"
-          find build_output -type f
-          exit 1
-        fi
-
-        echo "Using binary: $BIN_FILE"
-        cp "$BIN_FILE" firmware.bin
-
-        echo "firmware.bin size:"
-        ls -lh firmware.bin
-
-    - name: Update Version File
-      run: |
-        VERSION=$(grep -o 'CURRENT_VERSION\s*=\s*[0-9]*' main/main.ino \
-          | grep -o '[0-9]*' \
-          | head -1)
-
-        if [ -z "$VERSION" ]; then
-          VERSION="2"
-        fi
-
-        echo "$VERSION" > virsion.txt
-        echo "Version set to: $VERSION"
-
-    - name: Configure Git
-      run: |
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git config --local user.name "github-actions[bot]"
-
-    - name: Commit and Push to Main
-      run: |
-        git add firmware.bin
-        git add virsion.txt
-
-        if git diff --staged --quiet; then
-          echo "Nothing changed, no commit needed."
-        else
-          git commit -m "🤖 Auto-build firmware.bin [$(date -u '+%Y-%m-%d %H:%M UTC')]
-
-          Commit : ${{ github.sha }}
-          Branch : main
-          Board  : ESP32 DevKit V1
-          Version: $(cat virsion.txt)"
-
-          git push origin main
-          echo "Pushed firmware.bin and virsion.txt to main!"
-        fi
-
-    - name: Upload Artifact (backup)
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: firmware-${{ github.sha }}
-        path: |
-          firmware.bin
-          virsion.txt
-          compile_log.txt
-        retention-days: 30
-
-    - name: Job Summary
-      if: always()
-      run: |
-        echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-        echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Sketch | main.ino |" >> $GITHUB_STEP_SUMMARY
-        echo "| Board | ESP32 DevKit V1 |" >> $GITHUB_STEP_SUMMARY
-        echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| Version | $(cat virsion.txt 2>/dev/null || echo N/A) |" >> $GITHUB_STEP_SUMMARY
-        if [ -f firmware.bin ]; then
-          SIZE=$(ls -lh firmware.bin | awk '{print $5}')
-          echo "| Binary size | $SIZE |" >> $GITHUB_STEP_SUMMARY
-          echo "| Location | \`firmware.bin\` in main branch root |" >> $GITHUB_STEP_SUMMARY
-        fi
+      # ── 7. Push firmware.bin to repo for OTA ──────────────────────
+      - name: Push firmware.bin
+        run: |
+          cp ./build/main.ino.bin ./firmware.bin
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add firmware.bin
+          git diff --staged --quiet || git commit -m "OTA: update firmware [skip ci]"
+          git push
